@@ -37,6 +37,7 @@ const PKEY_LINK_TARGET_PARSING_PATH: PROPERTYKEY = PROPERTYKEY {
 
 const APPS_FOLDER_CLSID_PREFIX: &str = "::{4234d49b-0245-4df3-b780-3893943456e1}\\";
 const APPS_FOLDER_PREFIX: &str = "shell:AppsFolder\\";
+const EXPLORER_AUMID: &str = "Microsoft.Windows.Explorer";
 
 fn is_packaged_aumid(id: &str) -> bool {
     let Some((family, app)) = id.split_once('!') else {
@@ -62,16 +63,21 @@ fn apps_folder_aumid<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
         return None;
     }
     let id = value[prefix.len()..].trim();
-    is_packaged_aumid(id).then_some(id)
+    id.bytes()
+        .all(|c| c.is_ascii_alphanumeric() || b".-_!{}".contains(&c))
+        .then_some(id)
+        .filter(|id| !id.is_empty())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct PinnedApp {
     pub name: String,
-    /// Original `.lnk` path for launching with arguments/working dir intact.
+    /// Shortcut, executable, or stable AppsFolder launch target.
     pub launch_path: String,
     /// Resolved executable path when available (used to match running windows).
     pub target_exe: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aumid: Option<String>,
     /// Resolved icon source (`shell:AppsFolder\<AUMID>`, custom icon path, resolved `.exe`, or `.lnk`).
     pub icon_source: String,
 }
@@ -88,9 +94,11 @@ unsafe fn read_prop_string(store: &IPropertyStore, key: &PROPERTYKEY) -> Option<
     unsafe {
         // windows-rs 0.61 PROPVARIANT has no Drop impl: the caller must clear the variant itself.
         let mut val = store.GetValue(key).ok()?;
-        let pwstr = PropVariantToStringAlloc(&val).ok()?;
-        let text = pwstr.to_string().ok();
-        CoTaskMemFree(Some(pwstr.0.cast()));
+        let text = PropVariantToStringAlloc(&val).ok().and_then(|pwstr| {
+            let text = pwstr.to_string().ok();
+            CoTaskMemFree(Some(pwstr.0.cast()));
+            text
+        });
         let _ = PropVariantClear(&mut val);
         text.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
     }
@@ -167,13 +175,10 @@ fn resolve_shortcut(lnk_path: &str) -> ShortcutMeta {
             .ok()
             .and_then(|store| {
                 let direct = read_prop_string(&store, &PKEY_APPUSERMODEL_ID);
-                if direct.as_deref().is_some_and(is_packaged_aumid) {
-                    return direct;
-                }
-                let parsing_path = read_prop_string(&store, &PKEY_LINK_TARGET_PARSING_PATH)?;
-                apps_folder_aumid(&parsing_path, APPS_FOLDER_CLSID_PREFIX)
-                    .or_else(|| apps_folder_aumid(&parsing_path, APPS_FOLDER_PREFIX))
-                    .map(str::to_owned)
+                direct.or_else(|| {
+                    let parsing_path = read_prop_string(&store, &PKEY_LINK_TARGET_PARSING_PATH)?;
+                    apps_folder_id(&parsing_path).map(str::to_owned)
+                })
             })
             .or_else(|| {
                 let exe = Path::new(target_exe.as_deref()?).file_name()?.to_str()?;
@@ -196,7 +201,70 @@ fn explorer_arguments_aumid(arguments: &str) -> Option<&str> {
     let arguments_lower = arguments.to_ascii_lowercase();
     let start = arguments_lower.find("shell:appsfolder\\")?;
     let target = arguments[start..].split([' ', '"', '\t']).next()?;
-    apps_folder_aumid(target, APPS_FOLDER_PREFIX)
+    apps_folder_aumid(target, APPS_FOLDER_PREFIX).filter(|id| is_apps_folder_app(id))
+}
+
+fn is_apps_folder_app(id: &str) -> bool {
+    is_packaged_aumid(id) || id.eq_ignore_ascii_case(EXPLORER_AUMID)
+}
+
+pub(super) fn apps_folder_id(spec: &str) -> Option<&str> {
+    apps_folder_aumid(spec.trim(), APPS_FOLDER_PREFIX)
+        .or_else(|| apps_folder_aumid(spec.trim(), APPS_FOLDER_CLSID_PREFIX))
+}
+
+fn is_frame_host_spec(spec: &str) -> bool {
+    let file = spec.rsplit(['\\', '/']).next().unwrap_or_default();
+    let file = file.split_once(',').map_or(file, |(name, _)| name.trim());
+    file.eq_ignore_ascii_case("ApplicationFrameHost.exe")
+}
+
+/// Resolves app artwork in AppsFolder, shortcut, executable order.
+pub fn icon_candidates_for_app(
+    aumid: Option<&str>,
+    exe_path: &str,
+    shortcut_path: Option<&str>,
+) -> Vec<String> {
+    let mut specs = Vec::<String>::with_capacity(3);
+    let app_id: Option<String> = aumid
+        .map(str::trim)
+        .map(|raw| apps_folder_id(raw).unwrap_or(raw))
+        .filter(|id| is_apps_folder_app(id))
+        .map(str::to_owned)
+        .or_else(|| {
+            shortcut_path
+                .and_then(apps_folder_id)
+                .filter(|id| is_apps_folder_app(id))
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            apps_folder_id(exe_path)
+                .filter(|id| is_apps_folder_app(id))
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            exe_path
+                .to_ascii_lowercase()
+                .contains(r"\windowsapps\")
+                .then(|| resolve_windowsapps_aumid(exe_path))
+                .flatten()
+        });
+    if let Some(id) = app_id {
+        specs.push(format!("{APPS_FOLDER_PREFIX}{id}"));
+    }
+    for spec in shortcut_path.into_iter().chain([exe_path]).map(str::trim) {
+        let normalized = apps_folder_id(spec).map(|id| format!("{APPS_FOLDER_PREFIX}{id}"));
+        let spec = normalized.as_deref().unwrap_or(spec);
+        if !spec.is_empty()
+            && !is_frame_host_spec(spec)
+            && !specs
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(spec))
+        {
+            specs.push(spec.to_owned());
+        }
+    }
+    specs
 }
 
 fn expand_env_vars(input: &str) -> String {
@@ -367,67 +435,176 @@ fn is_resource_reference(value: &str) -> bool {
         .starts_with("ms-resource:")
 }
 
-/// AUMID → readable exe + icon source. Packaged apps with ACL-protected or
-/// virtual executables fall back to `shell:AppsFolder\<AUMID>` for both launch
-/// and icon (`WindowsTaskbarPinImporter.TryResolvePackagedApp`).
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetPackagesByPackageFamily(
+        family: *const u16,
+        count: *mut u32,
+        names: *mut *mut u16,
+        length: *mut u32,
+        buffer: *mut u16,
+    ) -> i32;
+    fn GetPackagePathByFullName(name: *const u16, length: *mut u32, path: *mut u16) -> i32;
+}
+
+fn registered_package_roots(family: &str) -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::ptr::null_mut;
+
+    const INSUFFICIENT_BUFFER: i32 = 122;
+    let family = wide(family);
+    let (mut count, mut length) = (0, 0);
+    // SAFETY: query required capacities, then provide both output buffers.
+    unsafe {
+        if GetPackagesByPackageFamily(
+            family.as_ptr(),
+            &mut count,
+            null_mut(),
+            &mut length,
+            null_mut(),
+        ) != INSUFFICIENT_BUFFER
+            || count > 1024
+            || length > 262_144
+        {
+            return Vec::new();
+        }
+        let mut names = vec![null_mut(); count as usize];
+        let mut buffer = vec![0; length as usize];
+        if GetPackagesByPackageFamily(
+            family.as_ptr(),
+            &mut count,
+            names.as_mut_ptr(),
+            &mut length,
+            buffer.as_mut_ptr(),
+        ) != 0
+        {
+            return Vec::new();
+        }
+        names
+            .into_iter()
+            .take(count as usize)
+            .filter_map(|name| {
+                // The package name points into the still-live buffer above.
+                let mut length = 0;
+                if name.is_null()
+                    || GetPackagePathByFullName(name, &mut length, null_mut())
+                        != INSUFFICIENT_BUFFER
+                    || length == 0
+                    || length > 32_768
+                {
+                    return None;
+                }
+                let mut path = vec![0; length as usize];
+                if GetPackagePathByFullName(name, &mut length, path.as_mut_ptr()) != 0 {
+                    return None;
+                }
+                let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+                Some(PathBuf::from(std::ffi::OsString::from_wide(&path[..end])))
+            })
+            .collect()
+    }
+}
+
+/// Registered paths first, then inbox and installation-directory fallbacks.
+pub(super) fn package_install_roots(family: &str) -> impl Iterator<Item = PathBuf> + use<> {
+    let registered = registered_package_roots(family);
+    let identity = family
+        .rsplit_once('_')
+        .map(|(package, publisher)| (package.to_ascii_lowercase(), publisher.to_ascii_lowercase()));
+    let inbox = identity
+        .as_ref()
+        .filter(|(package, publisher)| {
+            package == "windows.immersivecontrolpanel" && publisher == "cw5n1h2txyewy"
+        })
+        .and_then(|_| std::env::var_os("SystemRoot"))
+        .map(|root| PathBuf::from(root).join("ImmersiveControlPanel"));
+
+    registered.into_iter().chain(inbox).chain(
+        std::iter::once_with(move || {
+            let root = std::env::var_os("ProgramFiles")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+                .join("WindowsApps");
+            identity
+                .and_then(|(package, publisher)| {
+                    let prefix = format!("{package}_");
+                    let suffix = format!("_{publisher}");
+                    let entries = fs::read_dir(root).ok()?;
+                    Some(entries.flatten().filter_map(move |entry| {
+                        let name = entry.file_name().to_str()?.to_ascii_lowercase();
+                        (name.starts_with(&prefix) && name.ends_with(&suffix)).then(|| entry.path())
+                    }))
+                })
+                .into_iter()
+                .flatten()
+        })
+        .flatten(),
+    )
+}
+
+fn fallback_packaged_name(family: &str, app: &str) -> String {
+    let package = family.rsplit_once('_').map_or(family, |(name, _)| name);
+    if package.eq_ignore_ascii_case("windows.immersivecontrolpanel") {
+        return "Settings".to_owned();
+    }
+    if !app.is_empty() && !app.eq_ignore_ascii_case("app") && !app.contains('.') {
+        return app.to_owned();
+    }
+    package
+        .rsplit('.')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(app)
+        .to_owned()
+}
+
+/// Resolves a packaged or inbox AUMID to a durable AppsFolder pin.
 pub fn resolve_packaged_app(aumid: &str) -> Option<PinnedApp> {
-    let (family, app) = aumid.split_once('!')?;
-    let (package, publisher) = family.rsplit_once('_')?;
+    let launch_path = format!("{APPS_FOLDER_PREFIX}{aumid}");
+    if aumid.eq_ignore_ascii_case(EXPLORER_AUMID) {
+        return Some(PinnedApp {
+            name: "File Explorer".to_owned(),
+            launch_path: launch_path.clone(),
+            target_exe: std::env::var_os("SystemRoot").map(|root| {
+                PathBuf::from(root)
+                    .join("explorer.exe")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+            aumid: Some(EXPLORER_AUMID.to_owned()),
+            icon_source: launch_path,
+        });
+    }
     if !is_packaged_aumid(aumid) {
         return None;
     }
-    let root = std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
-        .join("WindowsApps");
-
-    let mut fallback_display = None;
-    let mut result = None;
-    if let Ok(entries) = fs::read_dir(&root) {
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let prefix = format!("{package}_");
-            if !name.starts_with(&prefix) || !name.ends_with(&format!("_{publisher}")) {
-                continue;
-            }
-            let Ok(xml) = fs::read_to_string(dir.join("AppxManifest.xml")) else {
-                continue;
-            };
-            let Some((display, relative)) = manifest_application(&xml, app) else {
-                continue;
-            };
-            if let Some(display) = display
-                && !is_resource_reference(&display)
-            {
-                fallback_display = Some(display);
-            }
-            let exe = relative
-                .map(|relative| dir.join(relative.replace('/', "\\")))
-                .filter(|path| path.is_file())
-                .map(|path| path.to_string_lossy().into_owned());
-            if let Some(exe) = exe {
-                result = Some(PinnedApp {
-                    name: fallback_display.clone().unwrap_or_else(|| app.to_owned()),
-                    launch_path: exe.clone(),
-                    target_exe: Some(exe.clone()),
-                    icon_source: exe,
-                });
-                break;
-            }
+    let (family, app) = aumid.split_once('!')?;
+    let mut name = fallback_packaged_name(family, app);
+    let mut target_exe = None;
+    for root in package_install_roots(family) {
+        let Ok(xml) = fs::read_to_string(root.join("AppxManifest.xml")) else {
+            continue;
+        };
+        let Some((display, executable)) = manifest_application(&xml, app) else {
+            continue;
+        };
+        if let Some(display) = display.filter(|s| !is_resource_reference(s)) {
+            name = display;
         }
+        target_exe = executable.map(|exe| {
+            root.join(exe.replace('/', "\\"))
+                .to_string_lossy()
+                .into_owned()
+        });
+        break;
     }
-    Some(result.unwrap_or_else(|| {
-        let launch_path = format!("{APPS_FOLDER_PREFIX}{aumid}");
-        PinnedApp {
-            name: fallback_display.unwrap_or_else(|| app.to_owned()),
-            launch_path: launch_path.clone(),
-            target_exe: None,
-            icon_source: launch_path,
-        }
-    }))
+    Some(PinnedApp {
+        name,
+        launch_path: launch_path.clone(),
+        target_exe,
+        aumid: Some(aumid.to_owned()),
+        icon_source: launch_path,
+    })
 }
 
 /// Imports packaged taskbar pins from the Explorer Taskband registry blob.
@@ -458,7 +635,7 @@ pub fn load_pins() -> Vec<PinnedApp> {
     // the initialization (or tolerates a thread already in an apartment).
     let _com = super::com::ComApartment::sta();
 
-    let mut items: Vec<PinnedApp> = entries
+    let items: Vec<PinnedApp> = entries
         .into_iter()
         .flatten()
         .flatten()
@@ -473,105 +650,229 @@ pub fn load_pins() -> Vec<PinnedApp> {
             }
             let name = path.file_stem()?.to_string_lossy().into_owned();
             let launch_path = path.to_string_lossy().into_owned();
-            let meta = resolve_shortcut(&launch_path);
-
-            let resolved_aumid = meta.aumid.clone().or_else(|| {
-                meta.target_exe
-                    .as_deref()
-                    .and_then(resolve_windowsapps_aumid)
-            });
-
-            // Mirror reference ApplicationIconProvider.GetForPinnedApp priority:
-            // 1. Custom shortcut IconLocation (e.g. PWA .ico or custom resource index)
-            // 2. Packaged Store app via shell:AppsFolder\<AUMID>
-            // 3. Resolved target executable
-            // 4. Fallback to .lnk itself
-            let icon_source = if let Some(ref icon_loc) = meta.icon_location {
-                icon_loc.clone()
-            } else if let Some(ref id) = resolved_aumid
-                && (id.contains('!') || meta.target_exe.is_none())
-            {
-                format!(r"shell:AppsFolder\{id}")
-            } else if let Some(ref exe) = meta.target_exe {
-                exe.clone()
-            } else {
-                launch_path.clone()
-            };
-
-            Some(PinnedApp {
-                name,
-                launch_path,
-                target_exe: meta.target_exe,
-                icon_source,
-            })
+            Some(pin_from_shortcut(name, &launch_path))
         })
         .collect();
 
     // Windows 11 stores packaged pins only in the Taskband blob; merge them
-    // with `.lnk` pins and keep one row per launch target.
-    let mut seen: HashSet<String> = items
-        .iter()
-        .map(|item| item.launch_path.to_ascii_lowercase())
-        .collect();
-    for pin in import_packaged_pins() {
-        if seen.insert(pin.launch_path.to_ascii_lowercase()) {
-            items.push(pin);
+    // with `.lnk` pins and keep one row per launch target or normalized AUMID.
+    let mut deduped: Vec<PinnedApp> = Vec::with_capacity(items.len());
+    for pin in items.into_iter().chain(import_packaged_pins()) {
+        if !deduped
+            .iter()
+            .any(|existing| pins_share_identity(existing, &pin))
+        {
+            deduped.push(pin);
         }
     }
-    items.sort_by_key(|a| a.name.to_lowercase());
-    items
+    deduped.sort_by_key(|a| a.name.to_lowercase());
+    deduped
 }
 
-/// Builds a `PinnedApp` from an arbitrary `.exe` or `.lnk` file path (for user pin / file drop).
+/// Normalized lowercase AUMID for a pin, from `pin.aumid` or an AppsFolder `launch_path`.
+pub fn pin_normalized_aumid(pin: &PinnedApp) -> Option<String> {
+    pin.aumid
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| apps_folder_id(id).unwrap_or(id).to_ascii_lowercase())
+        .or_else(|| apps_folder_id(&pin.launch_path).map(str::to_ascii_lowercase))
+}
+
+/// True when two pins represent the same app by either normalized `launch_path`
+/// or normalized `aumid` (including `shell:AppsFolder\<aumid>`).
+pub fn pins_share_identity(a: &PinnedApp, b: &PinnedApp) -> bool {
+    let a_path = a.launch_path.trim();
+    let b_path = b.launch_path.trim();
+    if !a_path.is_empty() && a_path.eq_ignore_ascii_case(b_path) {
+        return true;
+    }
+    if let (Some(a_id), Some(b_id)) = (pin_normalized_aumid(a), pin_normalized_aumid(b))
+        && a_id == b_id
+    {
+        return true;
+    }
+    false
+}
+
+/// True when a saved pin/unpin spec (`launch_path`, `shell:AppsFolder\<aumid>`, or
+/// legacy `WindowsApps\...\App.exe`) identifies the same app as `pin`.
+pub fn spec_matches_pin(spec: &str, pin: &PinnedApp) -> bool {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return false;
+    }
+    if pin.launch_path.trim().eq_ignore_ascii_case(spec) {
+        return true;
+    }
+    if let Some(pin_aumid) = pin_normalized_aumid(pin) {
+        if let Some(spec_aumid) = apps_folder_id(spec)
+            && spec_aumid.eq_ignore_ascii_case(&pin_aumid)
+        {
+            return true;
+        }
+        if let Some(target_exe) = pin.target_exe.as_deref().map(str::trim)
+            && !target_exe.is_empty()
+            && !is_frame_host_spec(target_exe)
+            && target_exe.eq_ignore_ascii_case(spec)
+        {
+            return true;
+        }
+        if spec.to_ascii_lowercase().contains(r"\windowsapps\")
+            && resolve_windowsapps_aumid(spec)
+                .is_some_and(|resolved| resolved.eq_ignore_ascii_case(&pin_aumid))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn pin_from_shortcut(name: String, launch_path: &str) -> PinnedApp {
+    let meta = resolve_shortcut(launch_path);
+    let aumid = meta.aumid.or_else(|| {
+        meta.target_exe
+            .as_deref()
+            .and_then(resolve_windowsapps_aumid)
+    });
+    let icon_source = if let Some(id) = aumid.as_deref().filter(|id| is_apps_folder_app(id)) {
+        format!("{APPS_FOLDER_PREFIX}{id}")
+    } else {
+        meta.icon_location
+            .filter(|loc| !is_frame_host_spec(loc))
+            .or_else(|| {
+                meta.target_exe
+                    .clone()
+                    .filter(|exe| !is_frame_host_spec(exe))
+            })
+            .unwrap_or_else(|| launch_path.to_owned())
+    };
+    PinnedApp {
+        name,
+        launch_path: launch_path.to_owned(),
+        target_exe: meta.target_exe,
+        aumid,
+        icon_source,
+    }
+}
+
+/// Builds a pin from a filesystem item or an AppsFolder target.
 pub fn pin_from_path(raw_path: &str) -> Option<PinnedApp> {
-    let path = PathBuf::from(raw_path);
+    if let Some(id) = apps_folder_id(raw_path) {
+        return resolve_packaged_app(id).or_else(|| {
+            let launch_path = format!("{APPS_FOLDER_PREFIX}{id}");
+            Some(PinnedApp {
+                name: id.to_owned(),
+                launch_path: launch_path.clone(),
+                target_exe: None,
+                aumid: Some(id.to_owned()),
+                icon_source: launch_path,
+            })
+        });
+    }
+    let path = Path::new(raw_path);
+    let name = path.file_stem()?.to_string_lossy().into_owned();
+    if let Some(id) = resolve_windowsapps_aumid(raw_path) {
+        return resolve_packaged_app(&id).map(|mut pin| {
+            if pin.target_exe.is_none() {
+                pin.target_exe = Some(raw_path.to_owned());
+            }
+            pin
+        });
+    }
     if !path.exists() {
         return None;
     }
-    let name = path.file_stem()?.to_string_lossy().into_owned();
-    let is_lnk = path
+    if path
         .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
-    if is_lnk {
-        let meta = resolve_shortcut(raw_path);
-        let resolved_aumid = meta.aumid.clone().or_else(|| {
-            meta.target_exe
-                .as_deref()
-                .and_then(resolve_windowsapps_aumid)
-        });
-        let icon_source = if let Some(ref icon_loc) = meta.icon_location {
-            icon_loc.clone()
-        } else if let Some(ref id) = resolved_aumid
-            && (id.contains('!') || meta.target_exe.is_none())
-        {
-            format!(r"shell:AppsFolder\{id}")
-        } else if let Some(ref exe) = meta.target_exe {
-            exe.clone()
-        } else {
-            raw_path.to_owned()
-        };
-        return Some(PinnedApp {
-            name,
-            launch_path: raw_path.to_owned(),
-            target_exe: meta.target_exe,
-            icon_source,
-        });
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
+    {
+        let _com = super::com::ComApartment::sta();
+        return Some(pin_from_shortcut(name, raw_path));
     }
-    let icon_source = resolve_windowsapps_aumid(raw_path)
-        .map(|id| format!(r"shell:AppsFolder\{id}"))
-        .unwrap_or_else(|| raw_path.to_owned());
     Some(PinnedApp {
         name,
         launch_path: raw_path.to_owned(),
         target_exe: Some(raw_path.to_owned()),
-        icon_source,
+        aumid: None,
+        icon_source: raw_path.to_owned(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_pin_json_defaults_aumid_and_omits_it_when_serializing() {
+        let json =
+            r#"{"name":"App","launch_path":"app.exe","target_exe":null,"icon_source":"app.exe"}"#;
+        let mut pin: PinnedApp = serde_json::from_str(json).unwrap();
+        assert!(pin.aumid.is_none());
+        assert!(serde_json::to_value(&pin).unwrap().get("aumid").is_none());
+        pin.aumid = Some(EXPLORER_AUMID.to_owned());
+        let decoded: PinnedApp =
+            serde_json::from_value(serde_json::to_value(&pin).unwrap()).unwrap();
+        assert_eq!(decoded.aumid.as_deref(), Some(EXPLORER_AUMID));
+    }
+
+    #[test]
+    fn icon_candidates_prefer_appsfolder_and_exclude_frame_host() {
+        assert_eq!(
+            icon_candidates_for_app(
+                Some(EXPLORER_AUMID),
+                r"C:\Windows\explorer.exe",
+                Some("Explorer.lnk"),
+            ),
+            [
+                r"shell:AppsFolder\Microsoft.Windows.Explorer",
+                "Explorer.lnk",
+                r"C:\Windows\explorer.exe",
+            ]
+        );
+        assert_eq!(
+            icon_candidates_for_app(
+                Some("Example.App_0123456789abc!App"),
+                r"C:\Windows\System32\ApplicationFrameHost.exe",
+                None,
+            ),
+            [r"shell:AppsFolder\Example.App_0123456789abc!App"]
+        );
+        assert_eq!(
+            icon_candidates_for_app(
+                Some("Microsoft.VisualStudioCode"),
+                r"C:\Apps\Code\Code.exe",
+                Some(r"C:\Links\Code.lnk"),
+            ),
+            [r"C:\Links\Code.lnk", r"C:\Apps\Code\Code.exe"]
+        );
+    }
+
+    #[test]
+    fn appsfolder_pins_bypass_filesystem_exists_checks() {
+        let explorer = pin_from_path(r"shell:appsfolder\Microsoft.Windows.Explorer").unwrap();
+        assert_eq!(explorer.aumid.as_deref(), Some(EXPLORER_AUMID));
+        assert_eq!(
+            explorer.launch_path,
+            r"shell:AppsFolder\Microsoft.Windows.Explorer"
+        );
+
+        let settings = pin_from_path(
+            r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel",
+        )
+        .unwrap();
+        assert_eq!(settings.name, "Settings");
+        assert_eq!(
+            settings.aumid.as_deref(),
+            Some(
+                "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+            )
+        );
+        assert_eq!(
+            settings.icon_source,
+            r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+        );
+    }
 
     #[test]
     fn explorer_store_shortcut_preserves_non_default_application_id() {
@@ -627,5 +928,64 @@ mod tests {
         assert!(resolve_packaged_app("not-an-aumid").is_none());
         // No Explorer Taskband on CI: must return an empty list, never panic.
         let _ = import_packaged_pins();
+    }
+
+    #[test]
+    fn pin_identity_deduplicates_matching_launch_paths_and_aumids() {
+        let aumid = "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App";
+        let apps_folder = format!("{APPS_FOLDER_PREFIX}{aumid}");
+        let taskband_pin = PinnedApp {
+            name: "Terminal".into(),
+            launch_path: apps_folder.clone(),
+            target_exe: Some(
+                r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe"
+                    .into(),
+            ),
+            aumid: Some(aumid.into()),
+            icon_source: apps_folder.clone(),
+        };
+        let legacy_shortcut_pin = PinnedApp {
+            name: "Windows Terminal".into(),
+            launch_path: r"C:\Users\Test\Terminal.lnk".into(),
+            target_exe: Some(
+                r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe"
+                    .into(),
+            ),
+            aumid: Some(aumid.to_ascii_lowercase()),
+            icon_source: apps_folder.clone(),
+        };
+        let apps_folder_no_aumid_field = PinnedApp {
+            name: "Terminal".into(),
+            launch_path: apps_folder.to_ascii_lowercase(),
+            target_exe: None,
+            aumid: None,
+            icon_source: apps_folder,
+        };
+        let other_pin = PinnedApp {
+            name: "Notepad".into(),
+            launch_path: r"C:\Windows\System32\notepad.exe".into(),
+            target_exe: Some(r"C:\Windows\System32\notepad.exe".into()),
+            aumid: None,
+            icon_source: r"C:\Windows\System32\notepad.exe".into(),
+        };
+
+        assert!(pins_share_identity(&taskband_pin, &legacy_shortcut_pin));
+        assert!(pins_share_identity(
+            &taskband_pin,
+            &apps_folder_no_aumid_field
+        ));
+        assert!(pins_share_identity(
+            &legacy_shortcut_pin,
+            &apps_folder_no_aumid_field
+        ));
+        assert!(!pins_share_identity(&taskband_pin, &other_pin));
+        assert!(spec_matches_pin(
+            r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.0_x64__8wekyb3d8bbwe\WindowsTerminal.exe",
+            &taskband_pin
+        ));
+        assert!(spec_matches_pin(
+            r"SHELL:AppsFolder\microsoft.windowsterminal_8wekyb3d8bbwe!app",
+            &legacy_shortcut_pin
+        ));
     }
 }

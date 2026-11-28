@@ -2,9 +2,14 @@
 
 use std::sync::mpsc;
 
-use windows::Win32::Foundation::HWND as WinHwnd;
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+use windows::Win32::Foundation::{HWND as WinHwnd, PROPERTYKEY, RPC_E_CHANGED_MODE};
+use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToStringAlloc};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize,
+};
 use windows::Win32::UI::Shell::IVirtualDesktopManager;
+use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
@@ -13,10 +18,10 @@ use windows_sys::Win32::System::Threading::{
     TerminateProcess,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, PostMessageW, SW_MINIMIZE, SW_RESTORE, SetForegroundWindow, ShowWindow,
-    WM_CLOSE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    EnumChildWindows, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow,
+    GetWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, PostMessageW, SW_MINIMIZE, SW_RESTORE,
+    SetForegroundWindow, ShowWindow, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows_sys::core::BOOL;
 
@@ -69,9 +74,9 @@ pub struct RunningWindow {
     pub hwnd: usize,
     pub pid: u32,
     pub title: String,
+    /// Image of the hosted app, or of the owner for an ordinary window.
     pub exe_path: String,
-    /// Packaged-app AppUserModelID, empty for classic Win32 processes. Mirrors
-    /// the `TrackedWindow.AppUserModelId` used for AUMID-aware pin matching.
+    /// Shell or process AppUserModelID, empty when neither provides an identity.
     pub aumid: String,
     pub is_foreground: bool,
 }
@@ -134,6 +139,7 @@ fn process_aumid(handle: HANDLE) -> String {
     String::from_utf16_lossy(chars)
 }
 
+#[derive(Default)]
 struct ProcessInfo {
     exe_path: String,
     aumid: String,
@@ -153,15 +159,131 @@ fn process_info(pid: u32) -> Option<ProcessInfo> {
         let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len);
         let aumid = process_aumid(handle);
         CloseHandle(handle);
-        (ok != 0 && len > 0).then(|| ProcessInfo {
-            exe_path: String::from_utf16_lossy(&buf[..len as usize]),
+        Some(ProcessInfo {
+            exe_path: if ok != 0 {
+                String::from_utf16_lossy(&buf[..len as usize])
+            } else {
+                String::new()
+            },
             aumid,
         })
     }
 }
 
 fn process_image_path(pid: u32) -> Option<String> {
-    process_info(pid).map(|info| info.exe_path)
+    process_info(pid)
+        .map(|info| info.exe_path)
+        .filter(|path| !path.is_empty())
+}
+
+struct EnumerationApartment(bool);
+
+impl Drop for EnumerationApartment {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: balances this thread's successful CoInitializeEx, including S_FALSE.
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+fn window_aumid(hwnd: HWND) -> Option<String> {
+    const KEY: PROPERTYKEY = PROPERTYKEY {
+        fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+        pid: 5,
+    };
+    // SAFETY: the enumeration thread has a COM apartment. Both allocations are
+    // released here, including when string conversion fails.
+    unsafe {
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(WinHwnd(hwnd)).ok()?;
+        let mut value = store.GetValue(&KEY).ok()?;
+        let text = PropVariantToStringAlloc(&value).ok().and_then(|text| {
+            let string = text.to_string().ok();
+            CoTaskMemFree(Some(text.0.cast()));
+            string
+        });
+        let _ = PropVariantClear(&mut value);
+        text.map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+    }
+}
+
+fn window_has_class(hwnd: HWND, expected: &str) -> bool {
+    let mut buf = [0u16; 64];
+    // SAFETY: bounded buffer and a borrowed window handle.
+    let len = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    len > 0
+        && buf[..len as usize]
+            .iter()
+            .copied()
+            .eq(expected.encode_utf16())
+}
+
+fn hosted_process_info(
+    hwnd: HWND,
+    frame_pid: u32,
+    has_com: bool,
+    window_id: Option<&str>,
+) -> Option<ProcessInfo> {
+    struct Children {
+        frame_pid: u32,
+        entries: Vec<(bool, u32, HWND)>,
+    }
+
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: EnumChildWindows calls this synchronously with a live Children.
+        unsafe {
+            let children = &mut *(lparam as *mut Children);
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid != 0 && pid != children.frame_pid {
+                children.entries.push((
+                    window_has_class(hwnd, "Windows.UI.Core.CoreWindow"),
+                    pid,
+                    hwnd,
+                ));
+            }
+        }
+        1
+    }
+
+    let mut children = Children {
+        frame_pid,
+        entries: Vec::new(),
+    };
+    // SAFETY: the callback state lives until enumeration returns.
+    unsafe {
+        EnumChildWindows(
+            hwnd,
+            Some(visit),
+            (&mut children as *mut Children) as LPARAM,
+        );
+    }
+    children.entries.sort_by_key(|&(is_core, _, _)| !is_core);
+    let mut seen = std::collections::HashSet::new();
+    let mut best = None;
+    for (is_core, pid, child_hwnd) in children.entries {
+        if !seen.insert(pid) {
+            continue;
+        }
+        let mut info = process_info(pid).unwrap_or_default();
+        if info.aumid.is_empty()
+            && has_com
+            && let Some(child_id) = window_aumid(child_hwnd)
+        {
+            info.aumid = child_id;
+        }
+        let has_aumid = !info.aumid.is_empty();
+        if !has_aumid && info.exe_path.is_empty() {
+            continue;
+        }
+        let matches_window = window_id.is_some_and(|id| id.eq_ignore_ascii_case(&info.aumid));
+        let rank = (matches_window, has_aumid, is_core);
+        if best.as_ref().is_none_or(|(previous, _)| rank > *previous) {
+            best = Some((rank, info));
+        }
+    }
+    best.map(|(_, info)| info)
 }
 
 fn window_title(hwnd: HWND) -> String {
@@ -192,6 +314,7 @@ fn is_shell_noise(exe_path: &str) -> bool {
 
 struct EnumCtx {
     self_pid: u32,
+    has_com: bool,
     foreground: HWND,
     out: Vec<RunningWindow>,
 }
@@ -218,8 +341,20 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         if pid == 0 || pid == ctx.self_pid {
             return 1;
         }
-        let Some(info) = process_info(pid) else {
+        let property_id = ctx.has_com.then(|| window_aumid(hwnd)).flatten();
+        let owner = process_info(pid).unwrap_or_default();
+        if is_shell_noise(&owner.exe_path) {
             return 1;
+        }
+        let is_frame = window_has_class(hwnd, "ApplicationFrameWindow")
+            || std::path::Path::new(&owner.exe_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("ApplicationFrameHost.exe"));
+        let info = if is_frame {
+            hosted_process_info(hwnd, pid, ctx.has_com, property_id.as_deref()).unwrap_or_default()
+        } else {
+            owner
         };
         if is_shell_noise(&info.exe_path) {
             return 1;
@@ -229,7 +364,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             pid,
             title,
             exe_path: info.exe_path,
-            aumid: info.aumid,
+            aumid: property_id.unwrap_or(info.aumid),
             is_foreground: hwnd == ctx.foreground,
         });
         1
@@ -237,10 +372,14 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 }
 
 pub fn enumerate_windows() -> Vec<RunningWindow> {
+    // SAFETY: COM initialization is per-thread. A caller's existing MTA can also use COM.
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let _apartment = EnumerationApartment(hr.is_ok());
     // SAFETY: `EnumWindows` invokes `enum_proc` synchronously on this thread.
     let foreground = unsafe { GetForegroundWindow() };
     let mut ctx = EnumCtx {
         self_pid: std::process::id(),
+        has_com: hr.is_ok() || hr == RPC_E_CHANGED_MODE,
         foreground,
         out: Vec::with_capacity(24),
     };
@@ -346,8 +485,8 @@ pub fn terminate_window_process_verified(hwnd_val: usize, pid: u32, expected_exe
     if !identity_matches(hwnd_val, pid) {
         return;
     }
-    if !expected_exe.is_empty()
-        && process_image_path(pid).is_some_and(|path| !path.eq_ignore_ascii_case(expected_exe))
+    if expected_exe.is_empty()
+        || !process_image_path(pid).is_some_and(|path| path.eq_ignore_ascii_case(expected_exe))
     {
         return;
     }
@@ -566,12 +705,40 @@ mod tests {
         let snapshot = rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("worker must deliver a snapshot");
-        // In a headless CI run there may be no eligible windows; the contract
-        // is that the worker sends a well-formed (possibly empty) snapshot.
+        // In a headless CI run there may be no eligible windows; elevated or
+        // restricted windows may legitimately have an empty `exe_path`, so only
+        // require valid top-level identity fields.
         assert!(
             snapshot
                 .iter()
-                .all(|window| !window.exe_path.is_empty() && window.hwnd != 0)
+                .all(|window| window.hwnd != 0 && window.pid != 0 && !window.title.is_empty())
         );
+    }
+
+    #[test]
+    fn enumeration_apartment_balances_com_init_and_tolerates_changed_mode() {
+        use windows::Win32::System::Com::COINIT_MULTITHREADED;
+
+        std::thread::spawn(|| {
+            // SAFETY: fresh thread initializes STA, then verifies RAII drop balances it.
+            let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            assert!(hr.is_ok());
+            let apartment = EnumerationApartment(hr.is_ok());
+            drop(apartment);
+
+            // Switch thread to MTA, then verify STA init returns RPC_E_CHANGED_MODE
+            // without owning the foreign apartment.
+            let mta = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            assert!(mta.is_ok());
+            let mta_guard = EnumerationApartment(mta.is_ok());
+            let changed = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            assert_eq!(changed, RPC_E_CHANGED_MODE);
+            let nested = EnumerationApartment(changed.is_ok());
+            assert!(!nested.0);
+            drop(nested);
+            drop(mta_guard);
+        })
+        .join()
+        .expect("COM apartment guard must not fault");
     }
 }

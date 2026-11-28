@@ -15,7 +15,7 @@ use windows_sys::Win32::UI::Shell::{SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellEx
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use super::{
-    APPS_FOLDER_CLSID_PREFIX, APPS_FOLDER_PREFIX, PKEY_APPUSERMODEL_ID, apps_folder_aumid,
+    APPS_FOLDER_PREFIX, EXPLORER_AUMID, PKEY_APPUSERMODEL_ID, apps_folder_id, is_apps_folder_app,
     is_packaged_aumid, read_prop_string, resolve_shortcut, resolve_windowsapps_aumid,
 };
 
@@ -36,9 +36,7 @@ pub fn launch_app(source: String, window: Option<usize>, elevated: bool) {
 }
 
 fn resolve_app_target(source: String, window: Option<usize>) -> String {
-    if let Some(id) = apps_folder_aumid(&source, APPS_FOLDER_PREFIX)
-        .or_else(|| apps_folder_aumid(&source, APPS_FOLDER_CLSID_PREFIX))
-    {
+    if let Some(id) = apps_folder_id(&source) {
         return format!("{APPS_FOLDER_PREFIX}{id}");
     }
 
@@ -56,17 +54,25 @@ fn resolve_app_target(source: String, window: Option<usize>) -> String {
 
     let packaged_id = shortcut
         .as_ref()
-        .and_then(|meta| meta.aumid.clone())
+        .and_then(|meta| {
+            meta.aumid.as_deref().filter(|id| {
+                is_packaged_aumid(id)
+                    || (!meta.has_arguments && id.eq_ignore_ascii_case(EXPLORER_AUMID))
+            })
+        })
+        .map(str::to_owned)
         .or_else(|| {
             if is_shortcut {
                 return None;
             }
-            executable?;
+            if !source.trim().is_empty() && executable.is_none() {
+                return None;
+            }
             let hwnd = HWND(window? as *mut _);
             // SAFETY: This worker has initialized COM and the shell validates the borrowed HWND.
             unsafe {
                 let store: IPropertyStore = SHGetPropertyStoreForWindow(hwnd).ok()?;
-                read_prop_string(&store, &PKEY_APPUSERMODEL_ID).filter(|id| is_packaged_aumid(id))
+                read_prop_string(&store, &PKEY_APPUSERMODEL_ID).filter(|id| is_apps_folder_app(id))
             }
         })
         .or_else(|| executable.and_then(resolve_windowsapps_aumid));
@@ -330,10 +336,24 @@ mod tests {
         );
         assert_eq!(
             resolve_app_target(
-                r"shell:appsfolder\Example.Product_0123456789abc!Client".to_owned(),
+                r"  shell:appsfolder\Example.Product_0123456789abc!Client  ".to_owned(),
                 None
             ),
             r"shell:AppsFolder\Example.Product_0123456789abc!Client"
+        );
+        assert_eq!(
+            resolve_app_target(
+                r"::{4234d49b-0245-4df3-b780-3893943456e1}\Microsoft.Windows.Explorer".to_owned(),
+                None
+            ),
+            r"shell:AppsFolder\Microsoft.Windows.Explorer"
+        );
+        assert_eq!(
+            resolve_app_target(
+                r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel".to_owned(),
+                None
+            ),
+            r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
         );
     }
 }
