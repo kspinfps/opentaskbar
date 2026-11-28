@@ -389,3 +389,175 @@ fn production_live_multi_brand_and_extended_vendors_are_wired() {
         Some(0x3434)
     );
 }
+
+/// Reference ranking for two samples of the same physical battery: verified live link,
+/// then non-stale, then provenance (lower = better: live GATT / vendor HID 0, standard HID
+/// 1, vendor daemon 2, Windows PnP 3, XInput 4).
+fn reference_prefer(candidate: (bool, bool, u8), existing: (bool, bool, u8)) -> bool {
+    let (c_live, c_stale, c_rank) = candidate;
+    let (e_live, e_stale, e_rank) = existing;
+    if c_live != e_live {
+        return c_live;
+    }
+    if c_stale != e_stale {
+        return !c_stale;
+    }
+    c_rank < e_rank
+}
+
+/// Reference expiry: an entry is retained while `now - sampled_at <= 30 min`, where
+/// `sampled_at` is the one persisted sample time (never the file write time).
+fn reference_retained(sampled_at: u64, now: u64) -> bool {
+    now.saturating_sub(sampled_at) <= 30 * 60
+}
+
+/// Reference G HUB percentage rule: integers are percentages; only a float strictly
+/// between 0 and 1 is a fraction.
+fn reference_ghub_percent(value: &serde_json::Value) -> Option<u32> {
+    let n = value.as_f64()?;
+    if !(0.0..=100.0).contains(&n) {
+        return None;
+    }
+    Some(if value.is_f64() && n > 0.0 && n < 1.0 {
+        (n * 100.0).round() as u32
+    } else {
+        n.round() as u32
+    })
+}
+
+/// Reference Corsair legacy (`C9 64`) block: level `data[2] & 0x7F`, state `data[4]`
+/// (0 offline, 1/2 battery, 4/5 charging).
+fn reference_corsair_legacy(data: &[u8]) -> Option<(u8, bool)> {
+    if data.len() < 5 || data[..2] != [0xC9, 0x64] {
+        return None;
+    }
+    let level = data[2] & 0x7F;
+    if level > 100 || !matches!(data[4], 1 | 2 | 4 | 5) {
+        return None;
+    }
+    Some((level, matches!(data[4], 4 | 5)))
+}
+
+/// Reference ASUS ROG 65-byte `00 12 07` layout: level at byte 5, charge state at byte 10.
+fn reference_asus_65(data: &[u8]) -> Option<(u8, bool)> {
+    if data.len() != 65 || data[..3] != [0x00, 0x12, 0x07] {
+        return None;
+    }
+    let (level, state) = (data[5], data[10]);
+    if level > 100 || state > 3 {
+        return None;
+    }
+    Some((level, matches!(state, 1 | 2)))
+}
+
+#[test]
+fn accuracy_reference_live_gatt_beats_pnp_and_expiry_never_renews() {
+    // Live uncached GATT 42% (rank 0) vs live Windows PnP 80% (rank 3): GATT wins.
+    assert!(reference_prefer((true, false, 0), (true, false, 3)));
+    assert!(!reference_prefer((true, false, 3), (true, false, 0)));
+    // A live reading always beats a stale registry snapshot, whatever its provenance.
+    assert!(reference_prefer((true, false, 3), (false, true, 0)));
+    // 31 minutes of continued polling: the persisted sample time never moves.
+    let sampled_at = 1_000_000u64;
+    for minute in 0..=30u64 {
+        assert!(reference_retained(sampled_at, sampled_at + minute * 60));
+    }
+    assert!(!reference_retained(sampled_at, sampled_at + 31 * 60));
+}
+
+#[test]
+fn accuracy_reference_protocol_vectors() {
+    assert_eq!(reference_ghub_percent(&serde_json::json!(1)), Some(1));
+    assert_eq!(reference_ghub_percent(&serde_json::json!(1.0)), Some(1));
+    assert_eq!(reference_ghub_percent(&serde_json::json!(0.42)), Some(42));
+    assert_eq!(reference_ghub_percent(&serde_json::json!(101)), None);
+
+    let mut legacy = [0u8; 64];
+    legacy[0] = 0xC9;
+    legacy[1] = 0x64;
+    legacy[2] = 0x80 | 78;
+    legacy[4] = 1;
+    assert_eq!(reference_corsair_legacy(&legacy), Some((78, false)));
+    legacy[4] = 0;
+    assert_eq!(reference_corsair_legacy(&legacy), None, "offline");
+
+    let mut chakram = [0u8; 65];
+    chakram[1] = 0x12;
+    chakram[2] = 0x07;
+    chakram[5] = 0x39;
+    chakram[6] = 0xFF;
+    assert_eq!(reference_asus_65(&chakram), Some((57, false)));
+}
+
+/// Bridge pinning the Bluetooth / HID accuracy fixes in production code.
+#[test]
+fn production_accuracy_fixes_are_wired() {
+    const BATTERY: &str = "crates/opentaskbar-app/src/platform/wireless_battery.rs";
+    const VENDORS_EXT: &str = "crates/opentaskbar-app/src/platform/wireless_vendors_ext.rs";
+    const TELEMETRY: &str = "crates/opentaskbar-app/src/widgets/telemetry.rs";
+    const WIDGETS: &str = "crates/opentaskbar-app/src/widgets/mod.rs";
+
+    common::assert_source_has(
+        BATTERY,
+        &[
+            "ReadValueWithCacheModeAsync(",
+            "BluetoothCacheMode::Uncached",
+            "GetGattServicesForUuidWithCacheModeAsync(",
+            "GattCommunicationStatus::Success",
+            "DEVPKEY_DEVICE_IS_CONNECTED",
+            "DEVPKEY_DEVICE_CONTAINER_ID",
+            "pub fn read_all_with_settings_forced(",
+            "STALE_TOMBSTONES",
+            "pub fn is_uncertain(self)",
+            "fn accuracy_live_gatt_beats_windows_pnp_for_same_physical_device(",
+            "fn accuracy_disconnected_device_expires_after_31_minutes_without_renewal(",
+            "fn accuracy_identical_name_peripherals_stay_separate_rows(",
+            "fn standard_hid_rejects_overload_and_preserves_zero_percent(",
+            "fn steelseries_nova7_direct_vs_discrete_and_nova5_offsets(",
+            "fn asus_rog_chakram_x_65_byte_layout_reports_57_percent(",
+            "fn ghub_battery_state_integer_one_is_one_percent(",
+        ],
+    );
+    common::assert_source_lacks(
+        BATTERY,
+        &["ReadValueAsync()", "0x0085 => &[0x0064, 0x0065, 0x0066"],
+    );
+    common::assert_source_has(
+        VENDORS_EXT,
+        &[
+            "CloudFlightVoltage",
+            "HpVendor50",
+            "GLORIOUS_FN_BATTERY",
+            "pub fn build_endgame_gear_feature_request(",
+            "pub const ZOWIE_BENQ_RX_VID",
+            "fn keychron_via_raw_hid_probe_is_removed(",
+            "fn hyperx_cloud_flight_big_endian_millivolt_curve(",
+        ],
+    );
+    common::assert_source_lacks(
+        VENDORS_EXT,
+        &[
+            "pub fn build_keychron_raw_hid_request(",
+            "pub fn is_valid_keychron_raw_hid_reply(",
+        ],
+    );
+    common::assert_source_has(
+        TELEMETRY,
+        &[
+            "pub fn apply_bluetooth_snapshot(",
+            "pub fn query_bluetooth_battery_powershell(",
+            "fn late_fallback_generation_never_reverts_a_fresh_reading(",
+        ],
+    );
+    common::assert_source_has(
+        WIDGETS,
+        &[
+            "wb_generation",
+            "pub fn refresh_bluetooth_devices_forced(",
+            "struct WirelessRefreshGuard",
+            "pub fn wireless_battery_summary_pairs(",
+            "pub(crate) fn lazy_subsystems_allocated(",
+        ],
+    );
+    common::assert_source_lacks(WIDGETS, &["bt_secondary_levels"]);
+}

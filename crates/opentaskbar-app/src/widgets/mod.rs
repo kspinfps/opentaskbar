@@ -32,7 +32,7 @@ pub mod widget_icons;
 pub mod widget_snapshot;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -369,8 +369,15 @@ pub struct WidgetRuntime {
     weather_fail_count: u32,
     weather_retry_at: Option<Instant>,
     bt_battery: Arc<Mutex<telemetry::BluetoothBatteryCache>>,
-    bt_secondary_levels: Arc<Mutex<HashMap<String, u8>>>,
-    wb_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic refresh generation; every worker result is tagged with the generation it
+    /// started with so a late result never replaces a newer snapshot.
+    wb_generation: Arc<AtomicU64>,
+    /// Single atomic refresh queue holding in-flight state plus any pending `(settings, force)`
+    /// follow-up request so mid-poll setting changes never run against a stale clone.
+    wb_queue: Arc<Mutex<WirelessRefreshQueue>>,
+    /// Active wakeup handle while the `bluetoothbattery` flyout is open, so background
+    /// refresh completion updates the open flyout immediately via `LiveEvent::Update`.
+    wb_live_update: Arc<Mutex<Option<flyout::LiveUpdateHandle>>>,
     last_wb_poll: Option<Instant>,
     notified_low_bt: HashSet<String>,
     ai_usage: Arc<Mutex<telemetry::AiUsageCache>>,
@@ -483,8 +490,9 @@ impl Default for WidgetRuntime {
             weather_fail_count: 0,
             weather_retry_at: None,
             bt_battery: Arc::new(Mutex::new(telemetry::BluetoothBatteryCache::default())),
-            bt_secondary_levels: Arc::new(Mutex::new(HashMap::new())),
-            wb_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wb_generation: Arc::new(AtomicU64::new(0)),
+            wb_queue: Arc::new(Mutex::new(WirelessRefreshQueue::default())),
+            wb_live_update: Arc::new(Mutex::new(None)),
             last_wb_poll: None,
             notified_low_bt: HashSet::new(),
             ai_usage: Arc::new(Mutex::new(telemetry::AiUsageCache::default())),
@@ -547,6 +555,169 @@ fn bt_next_threshold(current: i64) -> i64 {
         .find(|&&value| value > current)
         .copied()
         .unwrap_or(STEPS[0])
+}
+
+/// The single wireless poll cadence (the same 15..=300 s range the settings validator and
+/// the platform aggregator use).
+fn wireless_poll_secs(settings: &DockSettings) -> u64 {
+    setting_i64(
+        settings,
+        "WirelessBatteryPollSeconds",
+        i64::from(settings.wireless_battery_poll_seconds),
+    )
+    .clamp(15, 300) as u64
+}
+
+/// `IgnoredWirelessDevices` match by stable physical id (or legacy plain name).
+fn bt_is_ignored(ignored: &[String], device: &BluetoothBatteryDevice) -> bool {
+    ignored
+        .iter()
+        .any(|entry| device.matches_ignore_entry(entry))
+}
+
+fn notify_wireless_flyout(live_update: &Mutex<Option<flyout::LiveUpdateHandle>>) {
+    if let Ok(slot) = live_update.lock()
+        && let Some(handle) = slot.as_ref()
+    {
+        handle.notify();
+    }
+}
+
+/// Atomic queue coordinating the single background wireless battery worker.
+///
+/// Holding `in_flight` and `pending: Option<(DockSettings, bool)>` under one mutex prevents
+/// both lost-wakeup races and stale `DockSettings` clones when Listen-Only, ignore, or alias
+/// settings change mid-poll.
+#[derive(Default)]
+struct WirelessRefreshQueue {
+    in_flight: bool,
+    pending: Option<(DockSettings, bool)>,
+}
+
+/// Releases the wireless worker's `in_flight` claim and the cache `loading` flag on panic
+/// unwind, and wakes any open `bluetoothbattery` live flyout when the worker exits.
+struct WirelessRefreshGuard {
+    queue: Arc<Mutex<WirelessRefreshQueue>>,
+    cache: Arc<Mutex<telemetry::BluetoothBatteryCache>>,
+    live_update: Arc<Mutex<Option<flyout::LiveUpdateHandle>>>,
+    completed: bool,
+}
+
+impl Drop for WirelessRefreshGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut q = self
+                .queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            q.in_flight = false;
+            q.pending = None;
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.loading = false;
+            }
+        }
+        notify_wireless_flyout(&self.live_update);
+    }
+}
+
+fn wireless_kind_to_bt(kind: wireless_battery::WirelessDeviceKind) -> BluetoothDeviceKind {
+    match kind {
+        wireless_battery::WirelessDeviceKind::Mouse => BluetoothDeviceKind::Mouse,
+        wireless_battery::WirelessDeviceKind::Keyboard => BluetoothDeviceKind::Keyboard,
+        wireless_battery::WirelessDeviceKind::Headphones => BluetoothDeviceKind::Headphones,
+        wireless_battery::WirelessDeviceKind::Gamepad => BluetoothDeviceKind::Gamepad,
+        wireless_battery::WirelessDeviceKind::Other => BluetoothDeviceKind::Generic,
+    }
+}
+
+/// One aggregated reading -> one widget row, with level, spare level, sample time,
+/// staleness and link state taken from the same sample. Unknown levels yield `None`: they
+/// are never shown as 0%.
+fn wireless_reading_to_row(
+    reading: wireless_battery::WirelessReading,
+) -> Option<BluetoothBatteryDevice> {
+    let percent = u32::from(reading.level_percent_opt()?);
+    Some(BluetoothBatteryDevice {
+        kind: wireless_kind_to_bt(reading.device_kind),
+        percent,
+        source_label: reading.source.label().to_owned(),
+        charging: reading.is_charging && reading.is_connected && !reading.stale,
+        stale: reading.stale,
+        connected: reading.is_connected && !reading.stale,
+        sampled_at: Some(reading.sampled_at),
+        secondary_level: reading
+            .secondary_level
+            .map(|spare| (spare * 100.0).round().clamp(0.0, 100.0) as u8),
+        id: reading.id,
+        name: reading.name,
+    })
+}
+
+/// Returns `true` only when the PowerShell PnP fallback is permitted and needed: native
+/// providers returned no visible rows, native Bluetooth did not observe candidates that were
+/// merely hidden by `IgnoredWirelessDevices`, and `"bluetooth"` is not disabled.
+fn should_run_powershell_fallback(
+    settings: &DockSettings,
+    rows_empty: bool,
+    had_native_bluetooth: bool,
+) -> bool {
+    rows_empty && !had_native_bluetooth && wireless_battery::allows_bluetooth_fallback(settings)
+}
+
+/// Applies `IgnoredWirelessDevices` and `WirelessDeviceAliases` to PowerShell PnP fallback rows.
+fn filter_powershell_fallback_rows(
+    settings: &DockSettings,
+    rows: Vec<BluetoothBatteryDevice>,
+) -> Vec<BluetoothBatteryDevice> {
+    let ignored = setting_string_list(settings, "IgnoredWirelessDevices");
+    let agg_settings = wireless_battery::AggregatorSettings::from(settings);
+    rows.into_iter()
+        .filter(|d| {
+            !bt_is_ignored(&ignored, d) && !agg_settings.is_ignored_id_or_name(&d.id, &d.name)
+        })
+        .map(|mut d| {
+            d.name = agg_settings.display_name_id_or_name(&d.id, &d.name);
+            d
+        })
+        .collect()
+}
+
+/// One refresh pass tagged with `generation`: native providers first, then the PowerShell PnP
+/// fallback only when they reported nothing, native Bluetooth did not merely filter out ignored
+/// devices, and Bluetooth is not disabled. A failed fallback keeps the previous rows but marks
+/// them stale; nothing older than an applied generation can overwrite it.
+fn run_wireless_refresh(
+    settings: &DockSettings,
+    force: bool,
+    cache: &Arc<Mutex<telemetry::BluetoothBatteryCache>>,
+    generation: u64,
+) {
+    let outcome = wireless_battery::read_all_with_settings_forced_outcome(settings, force);
+    let rows: Vec<BluetoothBatteryDevice> = outcome
+        .readings
+        .into_iter()
+        .filter_map(wireless_reading_to_row)
+        .collect();
+    let snapshot = if should_run_powershell_fallback(
+        settings,
+        rows.is_empty(),
+        outcome.had_native_bluetooth,
+    ) {
+        telemetry::query_bluetooth_battery_powershell()
+            .map(|ps_rows| filter_powershell_fallback_rows(settings, ps_rows))
+    } else {
+        Ok(rows)
+    };
+    if let Ok(mut guard) = cache.lock() {
+        match snapshot {
+            Ok(rows) => {
+                telemetry::apply_bluetooth_snapshot(&mut guard, generation, rows);
+            }
+            Err(_) => {
+                telemetry::apply_bluetooth_error(&mut guard, generation);
+            }
+        }
+    }
 }
 
 /// `SystemStatsWidget` thermal bands: 70 °C warning, 85 °C critical.
@@ -1029,7 +1200,8 @@ impl WidgetRuntime {
         synced.line_at(pos_ms).map(|(_, line)| line.text.clone())
     }
 
-    /// Cached `(device_name, percent)` pairs for Dynamic Island Bluetooth HUDs.
+    /// Cached `(device_name, percent)` pairs for Dynamic Island Bluetooth HUDs. Retained
+    /// last-known rows are labelled as cached instead of being shown as live.
     pub fn wireless_battery_summary_pairs(&self) -> Vec<(String, u8)> {
         self.bt_battery
             .lock()
@@ -1038,7 +1210,14 @@ impl WidgetRuntime {
                 cache
                     .devices
                     .iter()
-                    .map(|dev| (dev.name.clone(), dev.percent.min(100) as u8))
+                    .map(|dev| {
+                        let name = if dev.is_live() {
+                            dev.name.clone()
+                        } else {
+                            loc::t_fmt("WirelessBatteryStale", &[&dev.name])
+                        };
+                        (name, dev.percent.min(100) as u8)
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -1195,13 +1374,9 @@ impl WidgetRuntime {
         }
         if settings.is_widget_enabled("bluetoothbattery") {
             // Wireless HID/GATT probes can take up to PROVIDER_TIMEOUT (1.2 s), so keep polling
-            // strictly off the UI thread and honour the user's WirelessBatteryPollSeconds cadence.
-            let poll_secs = setting_i64(
-                settings,
-                "WirelessBatteryPollSeconds",
-                i64::from(settings.wireless_battery_poll_seconds.max(10)),
-            )
-            .max(10) as u64;
+            // strictly off the UI thread. This tick is the single refresh clock: the worker
+            // always performs a real poll (the platform aggregate reuse window is bypassed).
+            let poll_secs = wireless_poll_secs(settings);
             if self
                 .last_wb_poll
                 .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(poll_secs))
@@ -1214,7 +1389,7 @@ impl WidgetRuntime {
                 cache
                     .devices
                     .iter()
-                    .filter(|d| !ignored.iter().any(|n| n.eq_ignore_ascii_case(&d.name)))
+                    .filter(|d| !bt_is_ignored(&ignored, d))
                     .count()
             });
             self.bt_width = bluetooth_width_dips(visible_count);
@@ -1229,11 +1404,12 @@ impl WidgetRuntime {
                 self.notified_low_bt.clear();
             } else if let Ok(cache) = self.bt_battery.lock() {
                 for dev in &cache.devices {
-                    if ignored.iter().any(|n| n.eq_ignore_ascii_case(&dev.name)) {
+                    // Retained last-known (stale / disconnected) rows never raise a toast.
+                    if bt_is_ignored(&ignored, dev) || !dev.is_live() {
                         continue;
                     }
                     if dev.percent <= threshold {
-                        if self.notified_low_bt.insert(dev.name.clone()) {
+                        if self.notified_low_bt.insert(dev.id.clone()) {
                             let msg = loc::t_fmt(
                                 "WirelessBatteryLowToast",
                                 &[&dev.name, &dev.percent.to_string()],
@@ -1241,7 +1417,7 @@ impl WidgetRuntime {
                             let _ = toast::show_info_toast(&msg);
                         }
                     } else if dev.percent > threshold.saturating_add(5) {
-                        self.notified_low_bt.remove(&dev.name);
+                        self.notified_low_bt.remove(&dev.id);
                     }
                 }
             }
@@ -1362,7 +1538,7 @@ impl WidgetRuntime {
                 let visible_count = self.bt_battery.lock().ok().map_or(0, |g| {
                     g.devices
                         .iter()
-                        .filter(|d| !ignored.iter().any(|n| n.eq_ignore_ascii_case(&d.name)))
+                        .filter(|d| !bt_is_ignored(&ignored, d))
                         .count()
                 });
                 bluetooth_width_dips(visible_count)
@@ -1472,82 +1648,97 @@ impl WidgetRuntime {
         &mut self.speedtest
     }
 
-    /// Off-thread wireless battery read used by both the 10 s tick and the flyout's Refresh
-    /// button. Honours the persisted ignored-device / alias / listen-only settings in the platform
-    /// provider, so a manual refresh never wakes a device that the user asked to listen to only.
+    /// Off-thread wireless battery read used by the poll tick. Honours the persisted
+    /// ignored-device / alias / listen-only settings in the platform provider, so a refresh
+    /// never wakes a device that the user asked to listen to only.
     pub fn refresh_bluetooth_devices(&self, settings: &DockSettings) {
-        if self
-            .wb_in_flight
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        self.spawn_wireless_refresh(settings, false);
+    }
+
+    /// Manual "Refresh": always performs a fresh poll. If a poll is already running, the
+    /// forced request is queued and that same worker polls again when it finishes (no
+    /// second thread).
+    pub fn refresh_bluetooth_devices_forced(&self, settings: &DockSettings) {
+        self.spawn_wireless_refresh(settings, true);
+    }
+
+    fn spawn_wireless_refresh(&self, settings: &DockSettings, force: bool) {
         {
-            return;
+            let mut q = self
+                .wb_queue
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if q.in_flight {
+                let prev_force = q.pending.as_ref().is_some_and(|(_, f)| *f);
+                q.pending = Some((settings.clone(), prev_force || force));
+                return;
+            }
+            q.in_flight = true;
+            if let Ok(mut cache) = self.bt_battery.lock() {
+                cache.loading = true;
+            }
         }
-        let settings_clone = settings.clone();
+        let initial_settings = settings.clone();
         let bt_cache = Arc::clone(&self.bt_battery);
-        let bt_secondary = Arc::clone(&self.bt_secondary_levels);
-        let in_flight = Arc::clone(&self.wb_in_flight);
+        let queue = Arc::clone(&self.wb_queue);
+        let generation = Arc::clone(&self.wb_generation);
+        let live_update = Arc::clone(&self.wb_live_update);
         let spawned = std::thread::Builder::new()
             .name("opentaskbar-wb".to_owned())
             .spawn(move || {
-                let readings = wireless_battery::read_all_with_settings(&settings_clone);
-                if readings.is_empty() {
-                    if let Ok(mut sec) = bt_secondary.lock() {
-                        sec.clear();
-                    }
-                    telemetry::refresh_bluetooth_battery(&bt_cache, true);
-                } else {
-                    let mut secondary_map = HashMap::new();
-                    let devices: Vec<BluetoothBatteryDevice> = readings
-                        .into_iter()
-                        .map(|reading| {
-                            if let Some(sec) = reading.secondary_level {
-                                let spare_pct = (sec * 100.0).round().clamp(0.0, 100.0) as u8;
-                                secondary_map.insert(reading.id.clone(), spare_pct);
+                // Releases `in_flight` and `loading` on panic unwind and wakes any open flyout.
+                let mut guard = WirelessRefreshGuard {
+                    queue: Arc::clone(&queue),
+                    cache: Arc::clone(&bt_cache),
+                    live_update: Arc::clone(&live_update),
+                    completed: false,
+                };
+                let mut cur_settings = initial_settings;
+                let mut cur_force = force;
+                let mut first_pass = true;
+                loop {
+                    let tag = generation.fetch_add(1, Ordering::AcqRel) + 1;
+                    run_wireless_refresh(&cur_settings, cur_force || first_pass, &bt_cache, tag);
+                    first_pass = false;
+                    let next = {
+                        let mut q = queue
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(next) = q.pending.take() {
+                            Some(next)
+                        } else {
+                            if let Ok(mut cache) = bt_cache.lock() {
+                                cache.loading = false;
                             }
-                            BluetoothBatteryDevice {
-                                id: reading.id.clone(),
-                                kind: match reading.device_kind {
-                                    wireless_battery::WirelessDeviceKind::Mouse => {
-                                        BluetoothDeviceKind::Mouse
-                                    }
-                                    wireless_battery::WirelessDeviceKind::Keyboard => {
-                                        BluetoothDeviceKind::Keyboard
-                                    }
-                                    wireless_battery::WirelessDeviceKind::Headphones => {
-                                        BluetoothDeviceKind::Headphones
-                                    }
-                                    wireless_battery::WirelessDeviceKind::Gamepad => {
-                                        BluetoothDeviceKind::Gamepad
-                                    }
-                                    wireless_battery::WirelessDeviceKind::Other => {
-                                        BluetoothDeviceKind::Generic
-                                    }
-                                },
-                                name: reading.name,
-                                percent: (reading.level_01 * 100.0).round().clamp(0.0, 100.0)
-                                    as u32,
-                                source_label: reading.source.label().to_owned(),
-                                charging: reading.is_charging,
-                                stale: reading.stale,
-                                sampled_at: None,
-                            }
-                        })
-                        .collect();
-                    if let Ok(mut sec) = bt_secondary.lock() {
-                        *sec = secondary_map;
-                    }
-                    if let Ok(mut cache) = bt_cache.lock() {
-                        cache.devices = devices;
-                        cache.last_fetch = Some(Instant::now());
-                        cache.loading = false;
+                            q.in_flight = false;
+                            guard.completed = true;
+                            None
+                        }
+                    };
+                    match next {
+                        Some((next_settings, next_force)) => {
+                            cur_settings = next_settings;
+                            cur_force = next_force;
+                            notify_wireless_flyout(&live_update);
+                        }
+                        None => break,
                     }
                 }
-                in_flight.store(false, std::sync::atomic::Ordering::Release);
             })
             .is_ok();
         if !spawned {
-            self.wb_in_flight
-                .store(false, std::sync::atomic::Ordering::Release);
+            {
+                let mut q = self
+                    .wb_queue
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                q.in_flight = false;
+                q.pending = None;
+                if let Ok(mut cache) = self.bt_battery.lock() {
+                    cache.loading = false;
+                }
+            }
+            notify_wireless_flyout(&self.wb_live_update);
         }
     }
 
@@ -2336,12 +2527,7 @@ impl WidgetRuntime {
             }
             "bluetoothbattery" => {
                 let ignored = setting_string_list(settings, "IgnoredWirelessDevices");
-                let poll_secs = setting_i64(
-                    settings,
-                    "WirelessBatteryPollSeconds",
-                    i64::from(settings.wireless_battery_poll_seconds.max(10)),
-                )
-                .max(10);
+                let poll_secs = wireless_poll_secs(settings);
                 let low = setting_i64(
                     settings,
                     "WirelessBatteryLowThreshold",
@@ -2355,22 +2541,30 @@ impl WidgetRuntime {
                     .map(|g| {
                         g.devices
                             .iter()
-                            .filter(|d| !ignored.iter().any(|n| n.eq_ignore_ascii_case(&d.name)))
+                            .filter(|d| !bt_is_ignored(&ignored, d))
                             .take(4)
                             .cloned()
                             .collect()
                     })
                     .unwrap_or_default();
+                // Last-known rows are labelled "(cached)" instead of looking live.
+                let shown_percent = |d: &BluetoothBatteryDevice| {
+                    if d.is_live() {
+                        format_percent(d.percent)
+                    } else {
+                        loc::t_fmt("WirelessBatteryStale", &[&format_percent(d.percent)])
+                    }
+                };
                 let headline = devices.first().map_or_else(
                     || loc::t("BluetoothNoDevices"),
-                    |d| format!("{} · {}", d.name, format_percent(d.percent)),
+                    |d| format!("{} · {}", d.name, shown_percent(d)),
                 );
                 let mut rows: Vec<IslandDetailRow> = devices
                     .iter()
                     .map(|d| {
                         row(
                             d.name.clone(),
-                            format_percent(d.percent),
+                            shown_percent(d),
                             Some(d.percent as f32 / 100.0),
                         )
                     })
@@ -2915,7 +3109,7 @@ impl WidgetRuntime {
                 true
             }
             ("bluetoothbattery", "refresh") => {
-                self.refresh_bluetooth_devices(settings);
+                self.refresh_bluetooth_devices_forced(settings);
                 true
             }
             ("bluetoothbattery", "bluetooth_settings") => {
@@ -3445,14 +3639,17 @@ impl WidgetRuntime {
                     .map(|g| {
                         g.devices
                             .iter()
-                            .filter(|d| !ignored.iter().any(|n| n.eq_ignore_ascii_case(&d.name)))
+                            .filter(|d| !bt_is_ignored(&ignored, d))
                             .take(3)
                             .map(|d| {
+                                // A retained last-known level never shows the live low-battery
+                                // or charging accent.
+                                let live = d.is_live();
                                 (
                                     d.kind,
                                     d.percent,
-                                    low_threshold > 0 && d.percent <= low_threshold,
-                                    d.charging,
+                                    live && low_threshold > 0 && d.percent <= low_threshold,
+                                    live && d.charging,
                                 )
                             })
                             .collect()
@@ -5118,10 +5315,14 @@ impl WidgetRuntime {
                 // WS-1: only a real live-event click/commit may request a settings save.
                 // Hover-generated flyouts must leave this `false`.
                 let mut settings_changed = false;
-                let mut selected = 0usize;
+                // Selection, rename and hide bind to the stable physical device id: a list
+                // that re-sorts between clicks never retargets the action to another device.
+                let mut selected_id: Option<String> = None;
                 let mut feedback: Option<String> = None;
-                // Visible rows use 100+i ids; the same list resolves a click back to a device so
-                // rename / hide always act on the *selected* row, not blindly on `devices[0]`.
+                // Snapshot of rendered ActionRow ids (100 + idx) so a background re-sort
+                // between render and click still resolves the exact row the user clicked.
+                let rendered_row_ids: std::cell::RefCell<Vec<String>> =
+                    std::cell::RefCell::new(Vec::new());
                 let visible = |cfg: &DockSettings| -> Vec<BluetoothBatteryDevice> {
                     let ignored = setting_string_list(cfg, "IgnoredWirelessDevices");
                     self.bt_battery
@@ -5129,66 +5330,62 @@ impl WidgetRuntime {
                         .map(|g| {
                             g.devices
                                 .iter()
-                                .filter(|d| {
-                                    !ignored.iter().any(|n| n.eq_ignore_ascii_case(&d.name))
-                                })
+                                .filter(|d| !bt_is_ignored(&ignored, d))
                                 .cloned()
                                 .collect()
                         })
                         .unwrap_or_default()
                 };
-                let alias_for = |cfg: &DockSettings, name: &str| -> String {
+                let selected_device = |cfg: &DockSettings, id: Option<&str>| {
+                    let devices = visible(cfg);
+                    id.and_then(|id| devices.iter().find(|d| d.id == id).cloned())
+                        .or_else(|| devices.first().cloned())
+                };
+                // Aliases are keyed by device id (legacy name keys are still honoured).
+                let alias_for = |cfg: &DockSettings, d: &BluetoothBatteryDevice| -> String {
                     setting_value(cfg, "WirelessDeviceAliases")
                         .and_then(|v| {
-                            v.as_object()
-                                .and_then(|m| m.get(name))
-                                .and_then(|s| s.as_str())
-                                .map(str::to_owned)
+                            let map = v.as_object()?.clone();
+                            map.iter()
+                                .find(|(key, _)| key.eq_ignore_ascii_case(&d.id))
+                                .or_else(|| map.iter().find(|(key, _)| key.as_str() == d.name))
+                                .and_then(|(_, alias)| alias.as_str().map(str::to_owned))
                         })
-                        .unwrap_or_else(|| name.to_owned())
+                        .unwrap_or_else(|| d.name.clone())
                 };
-                let prefill_for = |cfg: &DockSettings, idx: usize| -> String {
-                    visible(cfg)
-                        .get(idx)
-                        .map(|d| alias_for(cfg, &d.name))
+                let prefill_for = |cfg: &DockSettings, id: Option<&str>| -> String {
+                    selected_device(cfg, id)
+                        .map(|d| alias_for(cfg, &d))
                         .unwrap_or_default()
                 };
                 let build = |cfg: &DockSettings,
-                             selected: usize,
+                             selected: Option<&str>,
                              rename_value: String,
                              feedback: Option<&str>| {
                     let devices = visible(cfg);
+                    *rendered_row_ids.borrow_mut() = devices.iter().map(|d| d.id.clone()).collect();
                     let low = setting_i64(cfg, "WirelessBatteryLowThreshold", 20) as u32;
-                    let interval = setting_i64(cfg, "WirelessBatteryPollSeconds", 60) as u64;
+                    let interval = wireless_poll_secs(cfg);
                     let listen_only = setting_bool(cfg, "WirelessBatteryListenOnly", false);
-                    let last_fetch = self.bt_battery.lock().ok().and_then(|g| g.last_fetch);
-                    let secondary_levels = self
-                        .bt_secondary_levels
-                        .lock()
-                        .ok()
-                        .map(|g| g.clone())
-                        .unwrap_or_default();
+                    let loading = self.bt_battery.lock().ok().is_some_and(|g| g.loading);
                     let mut blocks: Vec<FlyoutBlock> = devices
                         .iter()
                         .enumerate()
                         .map(|(i, d)| {
-                            let shown = alias_for(cfg, &d.name);
-                            let charging = d.charging;
-                            let stale = d.stale
+                            let shown = alias_for(cfg, d);
+                            let stale = !d.is_live()
                                 || d.sampled_at
-                                    .is_some_and(|t| t.elapsed().as_secs() > interval * 2)
-                                || (d.sampled_at.is_none()
-                                    && last_fetch
-                                        .is_some_and(|t| t.elapsed().as_secs() > interval * 2));
+                                    .is_none_or(|t| t.elapsed().as_secs() > interval * 2);
+                            let charging = d.charging && !stale;
                             let pct_str = format_percent(d.percent);
                             let mut subtitle = if stale {
-                                loc::t_fmt("WirelessBatteryStale", &[&d.percent.to_string()])
+                                loc::t_fmt("WirelessBatteryStale", &[&pct_str])
                             } else if charging {
                                 loc::t("WirelessBatteryCharging")
                             } else {
                                 format!("{} · {pct_str}", d.source_label)
                             };
-                            if let Some(&spare) = secondary_levels.get(&d.id) {
+                            if let Some(spare) = d.secondary_level {
                                 let spare_text =
                                     loc::t_fmt("WirelessBatterySpareDock", &[&spare.to_string()]);
                                 subtitle = format!("{subtitle} · {spare_text}");
@@ -5197,10 +5394,11 @@ impl WidgetRuntime {
                                 id: 100 + i as u32,
                                 title: format!("{shown}{}", if charging { " ⚡" } else { "" }),
                                 subtitle: Some(subtitle),
-                                badge: Some(format!(
-                                    "{pct_str}{}",
-                                    if charging { " ⚡" } else { "" }
-                                )),
+                                badge: Some(if stale {
+                                    loc::t_fmt("WirelessBatteryStale", &[&pct_str])
+                                } else {
+                                    format!("{pct_str}{}", if charging { " ⚡" } else { "" })
+                                }),
                                 icon: None,
                                 destructive: false,
                             }
@@ -5209,7 +5407,10 @@ impl WidgetRuntime {
                     if blocks.is_empty() {
                         blocks.push(FlyoutBlock::Note(loc::t("WirelessBatteryNoDevices")));
                     }
-                    if let Some(d) = devices.get(selected.min(devices.len().saturating_sub(1))) {
+                    let current = selected
+                        .and_then(|id| devices.iter().find(|d| d.id == id))
+                        .or_else(|| devices.first());
+                    if let Some(d) = current {
                         blocks.push(FlyoutBlock::Separator);
                         blocks.push(FlyoutBlock::StatRow {
                             label: loc::t("WirelessBatterySource"),
@@ -5218,6 +5419,8 @@ impl WidgetRuntime {
                     }
                     if let Some(note) = feedback {
                         blocks.push(FlyoutBlock::Note(note.to_owned()));
+                    } else if loading {
+                        blocks.push(FlyoutBlock::Note(loc::t("WirelessBatteryRefresh")));
                     }
                     // C2 TextInput — device rename (1-64 chars).
                     blocks.push(FlyoutBlock::TextInput {
@@ -5269,41 +5472,58 @@ impl WidgetRuntime {
                         blocks,
                     }
                 };
-                let init = build(settings, 0, prefill_for(settings, 0), None);
+                let init = build(settings, None, prefill_for(settings, None), None);
+                let live_handle = flyout::LiveUpdateHandle::new();
+                if let Ok(mut slot) = self.wb_live_update.lock() {
+                    *slot = Some(live_handle.clone());
+                }
+                flyout::set_next_live_update_handle(Some(live_handle.clone()));
                 show_live!("bluetoothbattery", init, |ev| match ev {
-                    // Device row selection: prefill the rename box from the selected device.
+                    // Device row selection: resolve via the rendered row snapshot so live
+                    // re-sorts never select the wrong device or abruptly close the flyout.
                     LiveEvent::Click(id @ 100..=199) => {
                         let idx = (id - 100) as usize;
-                        if let Some(d) = visible(settings).get(idx) {
-                            selected = idx;
+                        let clicked_id = rendered_row_ids.borrow().get(idx).cloned();
+                        if let Some(target_id) = clicked_id
+                            && let Some(d) =
+                                visible(settings).into_iter().find(|d| d.id == target_id)
+                        {
+                            selected_id = Some(d.id.clone());
                             feedback = None;
                             LiveOutcome::Update(build(
                                 settings,
-                                selected,
-                                alias_for(settings, &d.name),
+                                selected_id.as_deref(),
+                                alias_for(settings, &d),
                                 feedback.as_deref(),
                             ))
                         } else {
-                            LiveOutcome::Close
+                            LiveOutcome::Update(build(
+                                settings,
+                                selected_id.as_deref(),
+                                prefill_for(settings, selected_id.as_deref()),
+                                feedback.as_deref(),
+                            ))
                         }
                     }
                     LiveEvent::Click(1) => {
-                        // Listen-only devices are refreshed passively by the platform provider.
-                        self.refresh_bluetooth_devices(settings);
+                        // Forced: bypasses the poll-interval reuse; queued if a poll is running.
+                        // Listen-only devices are still refreshed passively by the provider.
+                        self.refresh_bluetooth_devices_forced(settings);
                         feedback = Some(loc::t("WirelessBatteryRefresh"));
                         LiveOutcome::Update(build(
                             settings,
-                            selected,
-                            prefill_for(settings, selected),
+                            selected_id.as_deref(),
+                            prefill_for(settings, selected_id.as_deref()),
                             feedback.as_deref(),
                         ))
                     }
                     LiveEvent::Click(2) => {
-                        // Hide the *selected* device (not simply the first one).
-                        if let Some(d) = visible(settings).get(selected) {
+                        // Hide the *selected* device by its stable id (not the first row and
+                        // not every device that happens to share its name).
+                        if let Some(d) = selected_device(settings, selected_id.as_deref()) {
                             let mut list = setting_string_list(settings, "IgnoredWirelessDevices");
-                            if !list.iter().any(|n| n.eq_ignore_ascii_case(&d.name)) {
-                                list.push(d.name.clone());
+                            if !list.iter().any(|n| n.eq_ignore_ascii_case(&d.id)) {
+                                list.push(d.id.clone());
                                 set_setting(
                                     settings,
                                     "IgnoredWirelessDevices",
@@ -5311,23 +5531,23 @@ impl WidgetRuntime {
                                 );
                                 settings_changed = true;
                             }
-                            selected = selected.saturating_sub(1);
+                            selected_id = None;
                         }
                         LiveOutcome::Update(build(
                             settings,
-                            selected,
-                            prefill_for(settings, selected),
+                            selected_id.as_deref(),
+                            prefill_for(settings, selected_id.as_deref()),
                             feedback.as_deref(),
                         ))
                     }
                     LiveEvent::Click(3) => {
                         set_setting(settings, "IgnoredWirelessDevices", serde_json::json!([]));
                         settings_changed = true;
-                        selected = 0;
+                        selected_id = None;
                         LiveOutcome::Update(build(
                             settings,
-                            0,
-                            prefill_for(settings, 0),
+                            None,
+                            prefill_for(settings, None),
                             feedback.as_deref(),
                         ))
                     }
@@ -5347,8 +5567,8 @@ impl WidgetRuntime {
                         settings_changed = true;
                         LiveOutcome::Update(build(
                             settings,
-                            selected,
-                            prefill_for(settings, selected),
+                            selected_id.as_deref(),
+                            prefill_for(settings, selected_id.as_deref()),
                             feedback.as_deref(),
                         ))
                     }
@@ -5363,8 +5583,8 @@ impl WidgetRuntime {
                         settings_changed = true;
                         LiveOutcome::Update(build(
                             settings,
-                            selected,
-                            prefill_for(settings, selected),
+                            selected_id.as_deref(),
+                            prefill_for(settings, selected_id.as_deref()),
                             feedback.as_deref(),
                         ))
                     }
@@ -5377,7 +5597,7 @@ impl WidgetRuntime {
                                     .iter()
                                     .map(|d| {
                                         format!(
-                                            "{}|{}|{}%|{}|{}",
+                                            "{}|{}|{}%|{}|{}|{}",
                                             d.name,
                                             d.id,
                                             d.percent,
@@ -5386,7 +5606,8 @@ impl WidgetRuntime {
                                                 "charging"
                                             } else {
                                                 "discharging"
-                                            }
+                                            },
+                                            if d.is_live() { "live" } else { "cached" }
                                         )
                                     })
                                     .collect::<Vec<_>>()
@@ -5398,8 +5619,8 @@ impl WidgetRuntime {
                         feedback = Some(loc::t("WirelessBatteryDiagnosticsCopied"));
                         LiveOutcome::Update(build(
                             settings,
-                            selected,
-                            prefill_for(settings, selected),
+                            selected_id.as_deref(),
+                            prefill_for(settings, selected_id.as_deref()),
                             feedback.as_deref(),
                         ))
                     }
@@ -5411,11 +5632,11 @@ impl WidgetRuntime {
                             serde_json::json!(next),
                         );
                         settings_changed = true;
-                        self.refresh_bluetooth_devices(settings);
+                        self.refresh_bluetooth_devices_forced(settings);
                         LiveOutcome::Update(build(
                             settings,
-                            selected,
-                            prefill_for(settings, selected),
+                            selected_id.as_deref(),
+                            prefill_for(settings, selected_id.as_deref()),
                             feedback.as_deref(),
                         ))
                     }
@@ -5425,19 +5646,46 @@ impl WidgetRuntime {
                     }
                     LiveEvent::TextCommit { id: 50, text } => {
                         if (1..=64).contains(&text.len())
-                            && let Some(d) = visible(settings).get(selected)
+                            && let Some(d) = selected_device(settings, selected_id.as_deref())
                         {
                             let mut map = setting_value(settings, "WirelessDeviceAliases")
                                 .and_then(|v| v.as_object().cloned())
                                 .unwrap_or_default();
-                            map.insert(d.name.clone(), serde_json::json!(text));
+                            // Re-key a legacy name alias onto the stable id.
+                            map.remove(&d.name);
+                            map.insert(d.id.clone(), serde_json::json!(text));
                             set_setting(settings, "WirelessDeviceAliases", serde_json::json!(map));
                             settings_changed = true;
+                            selected_id = Some(d.id.clone());
                         }
-                        LiveOutcome::Update(build(settings, selected, text, feedback.as_deref()))
+                        LiveOutcome::Update(build(
+                            settings,
+                            selected_id.as_deref(),
+                            text,
+                            feedback.as_deref(),
+                        ))
+                    }
+                    LiveEvent::Update => {
+                        let still_loading = self.bt_battery.lock().ok().is_some_and(|g| g.loading);
+                        if !still_loading
+                            && feedback.as_deref()
+                                == Some(loc::t("WirelessBatteryRefresh").as_str())
+                        {
+                            feedback = None;
+                        }
+                        LiveOutcome::Update(build(
+                            settings,
+                            selected_id.as_deref(),
+                            prefill_for(settings, selected_id.as_deref()),
+                            feedback.as_deref(),
+                        ))
                     }
                     _ => LiveOutcome::Close,
                 });
+                live_handle.detach();
+                if let Ok(mut slot) = self.wb_live_update.lock() {
+                    *slot = None;
+                }
                 // WS-1: no unconditional `true` — a hover-opened flyout must not
                 // trigger settings save + live reload on the hook-owning UI thread.
                 return Self::flyout_settings_changed("bluetoothbattery", settings_changed);
@@ -6529,6 +6777,132 @@ mod tests {
             shown >= 10,
             "extrapolated position must not rewind the SMTC sample"
         );
+    }
+
+    fn wireless_sample(id: &str, level_01: f32, stale: bool) -> wireless_battery::WirelessReading {
+        wireless_battery::WirelessReading {
+            id: id.to_owned(),
+            name: "Arctis Nova Pro Wireless".to_owned(),
+            level_01,
+            sampled_at: Instant::now(),
+            is_connected: !stale,
+            is_charging: true,
+            source: wireless_battery::BatterySource::SteelSeriesHid,
+            stale,
+            device_kind: wireless_battery::WirelessDeviceKind::Headphones,
+            secondary_level: Some(0.5),
+        }
+    }
+
+    #[test]
+    fn wireless_rows_carry_every_sample_field_together() {
+        let row = wireless_reading_to_row(wireless_sample("hid:1038:12E0:A", 0.75, false))
+            .expect("known level");
+        assert_eq!(row.percent, 75);
+        assert_eq!(row.secondary_level, Some(50));
+        assert!(row.sampled_at.is_some());
+        assert!(row.is_live() && row.charging);
+        assert_eq!(row.kind, BluetoothDeviceKind::Headphones);
+
+        // A retained last-known row is not live and never "charging".
+        let stale = wireless_reading_to_row(wireless_sample("hid:1038:12E0:B", 0.75, true))
+            .expect("known level");
+        assert!(!stale.is_live() && !stale.charging);
+
+        // Unknown charge is dropped rather than rendered as 0%.
+        assert!(wireless_reading_to_row(wireless_sample("hid:1038:12E0:C", -1.0, false)).is_none());
+    }
+
+    #[test]
+    fn wireless_ignore_binds_to_the_stable_id() {
+        let a = wireless_reading_to_row(wireless_sample("hid:1038:12E0:A", 0.5, false)).unwrap();
+        let b = wireless_reading_to_row(wireless_sample("hid:1038:12E0:B", 0.5, false)).unwrap();
+        let ignored = vec![a.id.clone()];
+        assert!(bt_is_ignored(&ignored, &a));
+        assert!(
+            !bt_is_ignored(&ignored, &b),
+            "same-name device must stay visible"
+        );
+    }
+
+    #[test]
+    fn wireless_powershell_fallback_respects_disabled_vendors_and_ignores() {
+        let mut settings = DockSettings::default();
+        assert!(should_run_powershell_fallback(&settings, true, false));
+        // Native Bluetooth saw a device (e.g. hidden via ignore list): do not spawn PowerShell.
+        assert!(!should_run_powershell_fallback(&settings, true, true));
+        // Explicitly disabling Bluetooth must also suppress the PowerShell fallback.
+        settings.set_wireless_disabled_vendors(vec!["bluetooth".to_owned()]);
+        assert!(!should_run_powershell_fallback(&settings, true, false));
+
+        let mut policy_settings = DockSettings::default();
+        policy_settings
+            .ignored_wireless_devices
+            .push("bt:AABBCCDDEEFF".to_owned());
+        policy_settings
+            .wireless_device_aliases
+            .insert("bt:112233445566".to_owned(), "Work Buds".to_owned());
+        let parsed = telemetry::parse_bluetooth_powershell_lines(
+            "Hidden|BTHLE\\DEV_AABBCCDDEEFF\\7&1&0|True|70\n\
+             Buds|BTHLE\\DEV_112233445566\\7&1&0|True|85",
+        );
+        let filtered = filter_powershell_fallback_rows(&policy_settings, parsed);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "bt:112233445566");
+        assert_eq!(filtered[0].name, "Work Buds");
+    }
+
+    #[test]
+    fn wireless_stale_label_formats_percent_and_name_without_double_percent() {
+        let pct = format_percent(75);
+        let stale_pct = loc::t_fmt("WirelessBatteryStale", &[&pct]);
+        assert!(stale_pct.contains("75"));
+        assert!(stale_pct.contains('%'));
+        assert!(!stale_pct.contains("%%"));
+
+        let stale_name = loc::t_fmt("WirelessBatteryStale", &["AirPods Pro"]);
+        assert!(stale_name.contains("AirPods Pro"));
+        assert!(!stale_name.contains('%'));
+    }
+
+    #[test]
+    fn wireless_refresh_guard_clears_queue_and_loading_on_unwind() {
+        let queue = Arc::new(Mutex::new(WirelessRefreshQueue {
+            in_flight: true,
+            pending: Some((DockSettings::default(), true)),
+        }));
+        let cache = Arc::new(Mutex::new(telemetry::BluetoothBatteryCache {
+            loading: true,
+            ..Default::default()
+        }));
+        let live_update = Arc::new(Mutex::new(None));
+        let q2 = Arc::clone(&queue);
+        let c2 = Arc::clone(&cache);
+        let l2 = Arc::clone(&live_update);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = WirelessRefreshGuard {
+                queue: q2,
+                cache: c2,
+                live_update: l2,
+                completed: false,
+            };
+            panic!("simulated worker panic");
+        }));
+        let q = queue.lock().unwrap();
+        assert!(!q.in_flight);
+        assert!(q.pending.is_none());
+        assert!(!cache.lock().unwrap().loading);
+    }
+
+    #[test]
+    fn wireless_poll_cadence_uses_the_validated_range() {
+        let mut settings = DockSettings {
+            wireless_battery_poll_seconds: 5,
+            ..Default::default()
+        };
+        assert_eq!(wireless_poll_secs(&settings), 15);
+        settings.wireless_battery_poll_seconds = 45;
+        assert_eq!(wireless_poll_secs(&settings), 45);
     }
 
     #[test]

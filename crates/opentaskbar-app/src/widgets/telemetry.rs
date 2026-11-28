@@ -1939,8 +1939,14 @@ pub fn classify_bluetooth_device(name: &str, instance_id: &str) -> BluetoothDevi
     BluetoothDeviceKind::Generic
 }
 
+/// One wireless battery row. Every field describing the *same* sample lives here, so the
+/// level, spare battery, sample time, staleness and link state can never be torn apart by a
+/// concurrent refresh (they are replaced together under the cache lock).
 #[derive(Clone, Debug)]
 pub struct BluetoothBatteryDevice {
+    /// Stable physical identity (Bluetooth address / container / VID:PID:serial[:slot]).
+    /// Selection, rename aliases and ignore actions bind to this, never to the name or the
+    /// row index.
     pub id: String,
     pub name: String,
     pub percent: u32,
@@ -1948,23 +1954,69 @@ pub struct BluetoothBatteryDevice {
     /// `WirelessDeviceReading.GetSourceLabel()` equivalent (HID++, BLE GATT, XInput, ...).
     pub source_label: String,
     pub charging: bool,
+    /// Last-known value (device disconnected / not re-verified this poll).
     pub stale: bool,
+    /// Verified live link at sample time.
+    pub connected: bool,
     pub sampled_at: Option<Instant>,
+    /// Spare / dock battery (Arctis Nova Pro, Arctis Pro) of the same sample.
+    pub secondary_level: Option<u8>,
 }
 
 impl BluetoothBatteryDevice {
-    fn new(name: String, percent: u32, kind: BluetoothDeviceKind) -> Self {
+    fn new(id: String, name: String, percent: u32, kind: BluetoothDeviceKind) -> Self {
         Self {
-            id: String::new(),
+            id,
             name,
             percent,
             kind,
             source_label: "Bluetooth".to_owned(),
             charging: false,
             stale: false,
-            sampled_at: None,
+            connected: true,
+            sampled_at: Some(Instant::now()),
+            secondary_level: None,
         }
     }
+
+    /// `true` when the row is a verified live reading (low-battery alerts only fire for these).
+    pub fn is_live(&self) -> bool {
+        self.connected && !self.stale
+    }
+
+    /// Whether this row matches an `IgnoredWirelessDevices` entry (stable id first; plain
+    /// names are still honoured for lists written by older builds).
+    pub fn matches_ignore_entry(&self, entry: &str) -> bool {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return false;
+        }
+        if entry.eq_ignore_ascii_case(&self.id) || entry.eq_ignore_ascii_case(&self.name) {
+            return true;
+        }
+        // Match canonical `bt:<MAC12>` against legacy `bt-pnp:...` entries carrying the same MAC.
+        if let Some(entry_bt) = canonical_bt_id(entry)
+            && let Some(self_bt) = canonical_bt_id(&self.id)
+        {
+            return entry_bt.eq_ignore_ascii_case(&self_bt);
+        }
+        false
+    }
+}
+
+/// Extracts canonical `bt:<MAC12_UPPER>` from either an existing `bt:<MAC12>` id or a PnP
+/// instance id containing a 48-bit Bluetooth MAC (`DEV_<12 hex>` or `...&<12 hex>_...`).
+fn canonical_bt_id(raw: &str) -> Option<String> {
+    let upper = raw.trim().to_ascii_uppercase();
+    if let Some(rest) = upper.strip_prefix("BT:") {
+        let mac = rest.split('#').next().unwrap_or(rest);
+        if mac.len() == 12 && mac.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(format!("bt:{mac}"));
+        }
+        return None;
+    }
+    let instance = upper.strip_prefix("BT-PNP:").unwrap_or(&upper);
+    crate::platform::wireless_battery::bt_id_from_instance(instance)
 }
 
 #[derive(Clone, Default)]
@@ -1972,72 +2024,157 @@ pub struct BluetoothBatteryCache {
     pub devices: Vec<BluetoothBatteryDevice>,
     pub last_fetch: Option<Instant>,
     pub loading: bool,
+    /// Generation of the refresh whose result `devices` holds. A late, older refresh (e.g. a
+    /// slow PowerShell fallback) can never replace a newer snapshot.
+    pub generation: u64,
 }
 
-/// Non-blocking PnP Bluetooth battery query matching `{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2`.
+/// Applies a refresh result tagged with `generation`. Returns `false` (and leaves the cache
+/// untouched) when a newer generation has already been applied.
+pub fn apply_bluetooth_snapshot(
+    cache: &mut BluetoothBatteryCache,
+    generation: u64,
+    devices: Vec<BluetoothBatteryDevice>,
+) -> bool {
+    if generation < cache.generation {
+        return false;
+    }
+    cache.devices = devices;
+    cache.generation = generation;
+    cache.last_fetch = Some(Instant::now());
+    true
+}
+
+/// Marks cached rows stale on a refresh error unless a newer generation has already been
+/// applied. Returns `true` when the error applied to `cache`.
+pub fn apply_bluetooth_error(cache: &mut BluetoothBatteryCache, generation: u64) -> bool {
+    if generation < cache.generation {
+        return false;
+    }
+    for device in &mut cache.devices {
+        device.stale = true;
+        device.connected = false;
+        device.charging = false;
+    }
+    true
+}
+
+/// Synchronous PnP Bluetooth battery query (`{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2`)
+/// used as the fallback when the native providers report nothing. Runs on the caller's
+/// (worker) thread — no extra thread. Only devices whose physical link is verified
+/// (`DEVPKEY_Device_IsConnected` = `{83DA6326-97A6-4088-9453-A1923F573B29} 15`) are live;
+/// rows are keyed by PnP instance id, never merged by name.
+///
+/// `Err` means the query itself failed (PowerShell missing / non-zero exit), which callers
+/// must not confuse with `Ok(vec![])` (no battery-reporting device).
+pub fn query_bluetooth_battery_powershell() -> Result<Vec<BluetoothBatteryDevice>, String> {
+    let ps = r#"Get-PnpDevice -Class Bluetooth -Status OK -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName '{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2' -ErrorAction SilentlyContinue; $c = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName '{83DA6326-97A6-4088-9453-A1923F573B29} 15' -ErrorAction SilentlyContinue; if ($p -and $null -ne $p.Data) { "$($_.FriendlyName)|$($_.InstanceId)|$($c.Data)|$($p.Data)" } }"#;
+    let out = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!("powershell exited with {}", out.status));
+    }
+    Ok(parse_bluetooth_powershell_lines(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
+/// Parses `FriendlyName|InstanceId|IsConnected|Battery` lines. Unverified links are skipped
+/// (a paired, switched-off headset keeps its last PnP battery value).
+pub fn parse_bluetooth_powershell_lines(text: &str) -> Vec<BluetoothBatteryDevice> {
+    let mut found: Vec<BluetoothBatteryDevice> = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.trim().rsplitn(4, '|').collect();
+        if parts.len() != 4 {
+            continue;
+        }
+        let (level, connected, instance_id, raw_name) = (
+            parts[0].trim(),
+            parts[1].trim(),
+            parts[2].trim(),
+            parts[3].trim(),
+        );
+        let Ok(val) = level.parse::<u32>() else {
+            continue;
+        };
+        if val > 100 || raw_name.is_empty() || instance_id.is_empty() {
+            continue;
+        }
+        if !connected.eq_ignore_ascii_case("true") {
+            continue;
+        }
+        let id = crate::platform::wireless_battery::bt_id_from_instance(instance_id)
+            .unwrap_or_else(|| format!("bt-pnp:{}", instance_id.to_ascii_uppercase()));
+        if found.iter().any(|d| d.id == id) {
+            continue;
+        }
+        let kind = classify_bluetooth_device(raw_name, instance_id);
+        found.push(BluetoothBatteryDevice::new(
+            id,
+            clean_bluetooth_name(raw_name),
+            val,
+            kind,
+        ));
+    }
+    found
+}
+
+/// Releases the cache's `loading` flag on every exit path (including panics).
+struct LoadingGuard<'a>(&'a Arc<Mutex<BluetoothBatteryCache>>);
+
+impl Drop for LoadingGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.0.lock() {
+            g.loading = false;
+        }
+    }
+}
+
+/// Non-blocking PnP Bluetooth battery refresh (kept for callers that have no native
+/// provider). The result is applied with a generation guard and `loading` is always
+/// released.
 pub fn refresh_bluetooth_battery(cache: &Arc<Mutex<BluetoothBatteryCache>>, force: bool) {
-    let should = if let Ok(mut g) = cache.lock() {
+    let generation = if let Ok(mut g) = cache.lock() {
         let stale = g.last_fetch.is_none_or(|t| t.elapsed().as_secs() >= 60);
         if !g.loading && (force || stale) {
             g.loading = true;
-            true
+            Some(g.generation + 1)
         } else {
-            false
+            None
         }
     } else {
-        false
+        None
     };
-    if !should {
+    let Some(generation) = generation else {
         return;
-    }
-    let cache = Arc::clone(cache);
-    let _ = std::thread::Builder::new()
+    };
+    let worker_cache = Arc::clone(cache);
+    let spawned = std::thread::Builder::new()
         .name("opentaskbar-bt-bat".into())
         .spawn(move || {
-            let ps = r#"Get-PnpDevice -Class Bluetooth -Status OK -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName '{104EA319-6EE2-4701-BD47-8DDBF425BBE5} 2' -ErrorAction SilentlyContinue; if ($p -and $null -ne $p.Data) { "$($_.FriendlyName)|$($_.InstanceId)|$($p.Data)" } }"#;
-            let output = Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", ps])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
-            let mut found: Vec<BluetoothBatteryDevice> = Vec::new();
-            if let Ok(out) = output
-                && out.status.success()
-            {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    let parts: Vec<&str> = line.trim().rsplitn(3, '|').collect();
-                    if parts.len() == 3
-                        && let Ok(val) = parts[0].trim().parse::<u32>()
-                        && val <= 100
-                    {
-                        let raw_name = parts[2].trim();
-                        let instance_id = parts[1].trim();
-                        if raw_name.is_empty() {
-                            continue;
-                        }
-                        let kind = classify_bluetooth_device(raw_name, instance_id);
-                        let display = clean_bluetooth_name(raw_name);
-                        if let Some(existing) = found
-                            .iter_mut()
-                            .find(|d| d.name.eq_ignore_ascii_case(&display))
-                        {
-                            if existing.kind == BluetoothDeviceKind::Generic
-                                && kind != BluetoothDeviceKind::Generic
-                            {
-                                existing.kind = kind;
-                            }
-                            existing.percent = val;
-                        } else {
-                            found.push(BluetoothBatteryDevice::new(display, val, kind));
-                        }
+            let _loading = LoadingGuard(&worker_cache);
+            match query_bluetooth_battery_powershell() {
+                Ok(found) => {
+                    if let Ok(mut g) = worker_cache.lock() {
+                        apply_bluetooth_snapshot(&mut g, generation, found);
+                    }
+                }
+                Err(_) => {
+                    // Keep the previous rows but stop presenting them as live, unless a newer
+                    // refresh generation has already been applied.
+                    if let Ok(mut g) = worker_cache.lock() {
+                        apply_bluetooth_error(&mut g, generation);
                     }
                 }
             }
-            if let Ok(mut g) = cache.lock() {
-                g.devices = found;
-                g.loading = false;
-                g.last_fetch = Some(Instant::now());
-            }
-        });
+        })
+        .is_ok();
+    if !spawned && let Ok(mut g) = cache.lock() {
+        g.loading = false;
+    }
 }
 
 // --- Storage ---
@@ -4340,6 +4477,93 @@ pub fn ai_provider_detected(provider_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bt_row(id: &str, percent: u32) -> BluetoothBatteryDevice {
+        BluetoothBatteryDevice::new(
+            id.to_owned(),
+            "Headset".to_owned(),
+            percent,
+            BluetoothDeviceKind::Headphones,
+        )
+    }
+
+    #[test]
+    fn late_fallback_generation_never_reverts_a_fresh_reading() {
+        let mut cache = BluetoothBatteryCache::default();
+        // Generation 1 started first (slow PowerShell fallback), generation 2 is the
+        // forced manual refresh that finished first with the fresh native reading.
+        assert!(apply_bluetooth_snapshot(
+            &mut cache,
+            2,
+            vec![bt_row("bt:A", 41)]
+        ));
+        assert!(!apply_bluetooth_snapshot(
+            &mut cache,
+            1,
+            vec![bt_row("bt:A", 88)]
+        ));
+        assert_eq!(cache.generation, 2);
+        assert_eq!(cache.devices.len(), 1);
+        assert_eq!(cache.devices[0].percent, 41);
+        // A newer generation still applies (including an honest empty result).
+        assert!(apply_bluetooth_snapshot(&mut cache, 3, Vec::new()));
+        assert!(cache.devices.is_empty());
+    }
+
+    #[test]
+    fn powershell_fallback_keys_by_instance_and_requires_a_live_link() {
+        let text = "Buds Pro Hands-Free AG|BTHENUM\\{0000111E}_X\\7&1&0&A0B1C2D3E4F5_C00000000|True|80\n\
+                    Buds Pro Hands-Free AG|BTHENUM\\{0000111E}_X\\7&1&0&112233445566_C00000000|True|35\n\
+                    Old Headset|BTHENUM\\{0000111E}_X\\7&1&0&665544332211_C00000000|False|90\n\
+                    Broken|BTHENUM\\X|True|abc";
+        let rows = parse_bluetooth_powershell_lines(text);
+        assert_eq!(
+            rows.len(),
+            2,
+            "same-name devices stay separate; offline is skipped"
+        );
+        assert_eq!(rows[0].percent, 80);
+        assert_eq!(rows[1].percent, 35);
+        assert_ne!(rows[0].id, rows[1].id);
+        assert!(rows.iter().all(BluetoothBatteryDevice::is_live));
+        assert!(rows[0].matches_ignore_entry(&rows[0].id.to_ascii_lowercase()));
+        assert!(!rows[1].matches_ignore_entry(&rows[0].id));
+        assert_eq!(rows[0].id, "bt:A0B1C2D3E4F5");
+        assert_eq!(rows[1].id, "bt:112233445566");
+        // DEV_<12 hex> also canonicalizes to bt:<MAC12_UPPER>; non-MAC instances keep bt-pnp:.
+        let extra = "BLE Mouse|BTHLE\\DEV_aabbccddeeff\\7&1&0|True|64\n\
+                     HFP Audio|BTHHFENUM\\BthHFPAudio\\8&3A2B&0&97|True|50";
+        let extra_rows = parse_bluetooth_powershell_lines(extra);
+        assert_eq!(extra_rows.len(), 2);
+        assert_eq!(extra_rows[0].id, "bt:AABBCCDDEEFF");
+        assert!(extra_rows[0].matches_ignore_entry("bt-pnp:BTHLE\\DEV_AABBCCDDEEFF\\7&1&0"));
+        assert_eq!(
+            extra_rows[1].id,
+            "bt-pnp:BTHHFENUM\\BTHHFPAUDIO\\8&3A2B&0&97"
+        );
+    }
+
+    #[test]
+    fn bluetooth_error_path_respects_generation_and_clears_charging() {
+        let mut cache = BluetoothBatteryCache::default();
+        let mut dev = BluetoothBatteryDevice::new(
+            "bt:AABBCCDDEEFF".to_owned(),
+            "Headset".to_owned(),
+            80,
+            BluetoothDeviceKind::Headphones,
+        );
+        dev.charging = true;
+        assert!(apply_bluetooth_snapshot(&mut cache, 2, vec![dev]));
+        // Stale error from an older generation must be ignored.
+        assert!(!apply_bluetooth_error(&mut cache, 1));
+        assert!(cache.devices[0].is_live());
+        assert!(cache.devices[0].charging);
+        // Error from the current or newer generation marks stale, disconnected, not charging.
+        assert!(apply_bluetooth_error(&mut cache, 2));
+        assert!(cache.devices[0].stale);
+        assert!(!cache.devices[0].connected);
+        assert!(!cache.devices[0].charging);
+    }
 
     #[test]
     fn ai_secrets_live_in_the_shared_secrets_folder() {
