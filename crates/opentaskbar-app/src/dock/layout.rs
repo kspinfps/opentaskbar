@@ -1850,20 +1850,37 @@ pub fn stack_entry_visible(name: &str, hidden: bool, system: bool) -> bool {
 }
 
 /// Folders first (alphabetical), then files newest-first, capped at `cap`.
-pub fn order_stack_entries(mut entries: Vec<StackEntry>, cap: usize) -> Vec<StackEntry> {
-    entries.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir).then_with(|| {
-            if a.is_dir {
-                a.name.to_lowercase().cmp(&b.name.to_lowercase())
-            } else {
-                b.modified_secs
-                    .cmp(&a.modified_secs)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            }
-        })
-    });
-    entries.truncate(cap);
-    entries
+/// Precomputes lowercase sort keys once per entry and partitions to the top
+/// `cap` entries before sorting so large folders never allocate per comparison.
+pub fn order_stack_entries(entries: Vec<StackEntry>, cap: usize) -> Vec<StackEntry> {
+    if cap == 0 || entries.is_empty() {
+        return Vec::new();
+    }
+    let mut keyed: Vec<(String, StackEntry)> = entries
+        .into_iter()
+        .map(|entry| (entry.name.to_lowercase(), entry))
+        .collect();
+    let cmp = |(ka, a): &(String, StackEntry), (kb, b): &(String, StackEntry)| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| {
+                if a.is_dir {
+                    ka.cmp(kb)
+                } else {
+                    b.modified_secs
+                        .cmp(&a.modified_secs)
+                        .then_with(|| ka.cmp(kb))
+                }
+            })
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.path.cmp(&b.path))
+    };
+    if keyed.len() > cap {
+        keyed.select_nth_unstable_by(cap, cmp);
+        keyed.truncate(cap);
+    }
+    keyed.sort_by(cmp);
+    keyed.into_iter().map(|(_, entry)| entry).collect()
 }
 
 /// Display label of a stack folder: its last path component, or the path itself
@@ -3345,5 +3362,73 @@ mod tests {
         assert!(add_stack_folder(&mut folders, r"C:\Projects"));
         assert!(!add_stack_folder(&mut folders, "  "));
         assert_eq!(folders.len(), 2);
+    }
+
+    #[test]
+    fn order_stack_entries_precomputed_keys_cap_40_deterministically() {
+        let make = |name: String, is_dir: bool, modified_secs: u64| StackEntry {
+            path: format!(r"C:\Downloads\{name}"),
+            name,
+            is_dir,
+            modified_secs,
+        };
+
+        // Mix 12 folders + 90 files in scrambled order, including case variations and tied mtimes.
+        let mut raw = Vec::new();
+        for i in (0..90u64).rev() {
+            let name = if i % 2 == 0 {
+                format!("File_{i:03}.pdf")
+            } else {
+                format!("file_{i:03}.zip")
+            };
+            // Deliberately create ties every 5 files so lowercase-name tiebreaking is exercised.
+            raw.push(make(name, false, 1000 + (i / 5)));
+        }
+        for (idx, folder) in [
+            "zebra", "Alpha", "gamma", "Beta", "delta", "Epsilon", "omega", "Kappa", "sigma",
+            "Tau", "lambda", "Mu",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            raw.insert(idx * 3, make(folder.to_owned(), true, idx as u64));
+        }
+
+        let top_a = order_stack_entries(raw.clone(), STACK_FLYOUT_MAX_ITEMS);
+        let mut reversed = raw;
+        reversed.reverse();
+        let top_b = order_stack_entries(reversed, STACK_FLYOUT_MAX_ITEMS);
+
+        assert_eq!(top_a.len(), STACK_FLYOUT_MAX_ITEMS);
+        assert_eq!(
+            top_a, top_b,
+            "partitioned top-40 ordering must be deterministic across input permutations"
+        );
+
+        // First 12 entries are all folders sorted alphabetically case-insensitively.
+        let folder_names: Vec<&str> = top_a[..12].iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            folder_names,
+            vec![
+                "Alpha", "Beta", "delta", "Epsilon", "gamma", "Kappa", "lambda", "Mu", "omega",
+                "sigma", "Tau", "zebra",
+            ]
+        );
+        assert!(top_a[..12].iter().all(|e| e.is_dir));
+        assert!(top_a[12..].iter().all(|e| !e.is_dir));
+
+        // Remaining 28 files are newest-first, then alphabetical case-insensitively on ties.
+        for pair in top_a[12..].windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            assert!(
+                a.modified_secs > b.modified_secs
+                    || (a.modified_secs == b.modified_secs
+                        && a.name.to_lowercase() <= b.name.to_lowercase()),
+                "files out of order: {:?} before {:?}",
+                a,
+                b
+            );
+        }
+        assert!(order_stack_entries(top_a, 0).is_empty());
     }
 }

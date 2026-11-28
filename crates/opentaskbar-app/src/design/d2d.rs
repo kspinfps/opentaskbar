@@ -70,12 +70,13 @@ pub fn d2d_color_channels(
 }
 
 #[cfg(windows)]
-pub use dc_renderer::{DcD2d, TextAlign, d2d_rect, paint_dib_d2d};
+pub use dc_renderer::{D2dIconBitmapCache, DcD2d, TextAlign, d2d_rect, paint_dib_d2d};
 
 #[cfg(windows)]
 mod dc_renderer {
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use windows::Win32::Foundation::RECT as WinRect;
     use windows::Win32::Graphics::Direct2D::Common::{
@@ -140,6 +141,8 @@ mod dc_renderer {
         }
     }
 
+    static NEXT_TARGET_GEN: AtomicU64 = AtomicU64::new(1);
+
     /// Thread-local Direct2D + DirectWrite renderer bound to a 32-bit DIB section.
     ///
     /// Shared across dock flyouts, live thumbnail previews, and the window picker so
@@ -149,6 +152,7 @@ mod dc_renderer {
         _factory: ID2D1Factory1,
         dwrite: IDWriteFactory,
         target: ID2D1DCRenderTarget,
+        target_generation: u64,
         tabular: Option<IDWriteTypography>,
         formats: HashMap<(bool, u16, u16, u8, String), IDWriteTextFormat>,
         covers: HashMap<String, Option<ID2D1Bitmap>>,
@@ -185,10 +189,12 @@ mod dc_renderer {
                         parameter: 1,
                     });
                 });
+                let target_generation = NEXT_TARGET_GEN.fetch_add(1, Ordering::Relaxed);
                 Some(Self {
                     _factory: factory,
                     dwrite,
                     target,
+                    target_generation,
                     tabular,
                     formats: HashMap::new(),
                     covers: HashMap::new(),
@@ -198,6 +204,12 @@ mod dc_renderer {
 
         pub fn target(&self) -> &ID2D1DCRenderTarget {
             &self.target
+        }
+
+        /// Monotonic generation of the active `ID2D1DCRenderTarget`. Callers caching
+        /// target-bound `ID2D1Bitmap`s clear their cache whenever this changes.
+        pub fn target_generation(&self) -> u64 {
+            self.target_generation
         }
 
         pub fn clear(&self, color: D2D1_COLOR_F) {
@@ -513,6 +525,45 @@ mod dc_renderer {
             }
         }
 
+        /// Premultiplies a straight-alpha BGRA32 buffer and uploads it to an `ID2D1Bitmap`
+        /// bound to the current render target.
+        pub fn create_bgra_bitmap(
+            &self,
+            width: u32,
+            height: u32,
+            straight_bgra: &[u8],
+        ) -> Option<ID2D1Bitmap> {
+            let expected = (width as usize)
+                .checked_mul(height as usize)?
+                .checked_mul(4)?;
+            if width == 0 || height == 0 || straight_bgra.len() < expected {
+                return None;
+            }
+            let src = &straight_bgra[..expected];
+            let mut premul = Vec::with_capacity(expected);
+            for px in src.as_chunks::<4>().0 {
+                let a = u16::from(px[3]);
+                premul.push(((u16::from(px[0]) * a + 127) / 255) as u8);
+                premul.push(((u16::from(px[1]) * a + 127) / 255) as u8);
+                premul.push(((u16::from(px[2]) * a + 127) / 255) as u8);
+                premul.push(px[3]);
+            }
+            self.create_premul_bitmap(width, height, &premul)
+        }
+
+        /// Draws an already-uploaded `ID2D1Bitmap` into `dst`.
+        pub fn draw_bitmap(&self, bitmap: &ID2D1Bitmap, dst: D2D_RECT_F) {
+            unsafe {
+                self.target.DrawBitmap(
+                    bitmap,
+                    Some(&dst),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+            }
+        }
+
         /// Draws a straight-alpha BGRA32 buffer into `dst` (premultiplies for D2D).
         pub fn draw_bgra_bitmap(
             &self,
@@ -521,30 +572,8 @@ mod dc_renderer {
             straight_bgra: &[u8],
             dst: D2D_RECT_F,
         ) {
-            if width == 0
-                || height == 0
-                || straight_bgra.len() < (width as usize) * (height as usize) * 4
-            {
-                return;
-            }
-            let mut premul = Vec::with_capacity(straight_bgra.len());
-            for px in straight_bgra.as_chunks::<4>().0 {
-                let a = u16::from(px[3]);
-                premul.push(((u16::from(px[0]) * a + 127) / 255) as u8);
-                premul.push(((u16::from(px[1]) * a + 127) / 255) as u8);
-                premul.push(((u16::from(px[2]) * a + 127) / 255) as u8);
-                premul.push(px[3]);
-            }
-            if let Some(bitmap) = self.create_premul_bitmap(width, height, &premul) {
-                unsafe {
-                    self.target.DrawBitmap(
-                        &bitmap,
-                        Some(&dst),
-                        1.0,
-                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                        None,
-                    );
-                }
+            if let Some(bitmap) = self.create_bgra_bitmap(width, height, straight_bgra) {
+                self.draw_bitmap(&bitmap, dst);
             }
         }
 
@@ -581,6 +610,74 @@ mod dc_renderer {
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                     None,
                 );
+            }
+        }
+    }
+
+    const MAX_CACHED_ICON_BITMAPS: usize = 128;
+
+    /// Fast 64-bit content fingerprint for an icon BGRA buffer (`chunks_exact(8)`).
+    fn bgra_content_hash(width: u32, height: u32, bgra: &[u8]) -> u64 {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut h = ((u64::from(width) << 32) | u64::from(height)).wrapping_mul(K);
+        let (chunks, rem) = bgra.as_chunks::<8>();
+        for chunk in chunks {
+            let word = u64::from_le_bytes(*chunk);
+            h = (h.rotate_left(5) ^ word).wrapping_mul(K);
+        }
+        for &byte in rem {
+            h = (h.rotate_left(5) ^ u64::from(byte)).wrapping_mul(K);
+        }
+        h ^ (bgra.len() as u64)
+    }
+
+    /// Per-flyout cache of premultiplied `ID2D1Bitmap`s keyed by `(content_hash, width, height)`.
+    /// Automatically invalidates if the thread-local `DcD2d` render target is recreated,
+    /// and releases all GPU bitmaps when cleared or dropped on flyout close.
+    #[derive(Default)]
+    pub struct D2dIconBitmapCache {
+        target_gen: u64,
+        entries: HashMap<(u64, u32, u32), ID2D1Bitmap>,
+    }
+
+    impl D2dIconBitmapCache {
+        pub fn clear(&mut self) {
+            self.entries.clear();
+            self.target_gen = 0;
+        }
+
+        pub fn draw_bgra(
+            &mut self,
+            d2d: &DcD2d,
+            width: u32,
+            height: u32,
+            straight_bgra: &[u8],
+            dst: D2D_RECT_F,
+        ) {
+            let expected = match (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|n| n.checked_mul(4))
+            {
+                Some(n) if width > 0 && height > 0 && straight_bgra.len() >= n => n,
+                _ => return,
+            };
+            let target_gen = d2d.target_generation();
+            if self.target_gen != target_gen {
+                self.entries.clear();
+                self.target_gen = target_gen;
+            }
+            let pixels = &straight_bgra[..expected];
+            let key = (bgra_content_hash(width, height, pixels), width, height);
+            if let Some(bitmap) = self.entries.get(&key) {
+                d2d.draw_bitmap(bitmap, dst);
+                return;
+            }
+            if let Some(bitmap) = d2d.create_bgra_bitmap(width, height, pixels) {
+                d2d.draw_bitmap(&bitmap, dst);
+                if self.entries.len() >= MAX_CACHED_ICON_BITMAPS {
+                    self.entries.clear();
+                }
+                self.entries.insert(key, bitmap);
             }
         }
     }

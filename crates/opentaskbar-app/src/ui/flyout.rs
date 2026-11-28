@@ -9,14 +9,16 @@
 //!   `StatusHeader`, `Hero`, `ToggleGrid`, `ProgressBar`, `StatRow`, `ActionRow`, `AppRow`, `ButtonBar`
 //! - Mouse-wheel vertical scrolling + thin scrollbar thumb + toggle-close suppression.
 
-use crate::design::d2d::{DcD2d, TextAlign, d2d_color as d2d_rgba, d2d_rect, paint_dib_d2d};
+use crate::design::d2d::{
+    D2dIconBitmapCache, DcD2d, TextAlign, d2d_color as d2d_rgba, d2d_rect, paint_dib_d2d,
+};
 use crate::platform::win32_helpers::{pt_in_rect, set_dwm_u32, set_window_long_ptr};
 use opentaskbar_core::i18n as loc;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
@@ -97,6 +99,8 @@ const SLIDE_OFFSET_DIPS: f32 = 7.0;
 // WM_APP+2 is the dock's WM_APP_ICONS message; use the private WM_APP+9 slot
 // so a cross-window post can never land in the dock's icon handler.
 const WM_APP_MENU_CANDIDATE: u32 = 0x8009;
+/// Async worker -> live flyout wakeup message (`LiveUpdateHandle::notify`).
+const WM_APP_LIVE_UPDATE: u32 = 0x800A;
 
 /// Tracks the native `WM_COMMAND`/`#32768` context menu opened from a flyout.
 static EXTERNAL_MENU_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -319,7 +323,7 @@ fn suppression_window_hit(recorded_at: Option<Instant>, now: Instant) -> bool {
 }
 
 /// Consumes the one-shot suppression entry for `tag`, if it is still fresh.
-fn should_suppress_reopen(tag: &str) -> bool {
+pub fn should_suppress_reopen(tag: &str) -> bool {
     if tag.is_empty() {
         return false;
     }
@@ -766,6 +770,13 @@ struct FlyoutState<'a> {
     dpi: f32,
     is_dark: bool,
     spec: FlyoutSpec,
+    anchor_x_px: i32,
+    anchor_y_px: i32,
+    edge: FlyoutEdge,
+    use_anchor_position: bool,
+    screen: RECT,
+    width_px: i32,
+    height_px: i32,
     x_px: i32,
     target_y_px: i32,
     slide_px: i32,
@@ -782,6 +793,8 @@ struct FlyoutState<'a> {
     shadow_rings: u8,
     on_secondary: Option<&'a mut dyn FnMut(u32) -> bool>,
     on_live: Option<&'a mut dyn FnMut(LiveEvent) -> LiveOutcome>,
+    /// Optional handle woken by a background worker to trigger `LiveEvent::Update`.
+    live_update: Option<LiveUpdateHandle>,
     /// Whether this live flyout's widget expects `LiveEvent::Update` ticks.
     tick_enabled: bool,
     border: BorderStyle,
@@ -789,6 +802,8 @@ struct FlyoutState<'a> {
     /// active strictly when `border.glass_config.enabled` is true.
     spatial_glass: Option<SpatialGlassHost>,
     dcomp_fg: Option<DCompForeground>,
+    /// Per-target premultiplied `ID2D1Bitmap` cache for `ActionRow` / `AppRow` icons.
+    icon_bitmaps: D2dIconBitmapCache,
     content_top_px: i32,
     viewport_h_px: i32,
     content_h_px: i32,
@@ -920,6 +935,82 @@ fn is_single_pua_glyph(s: &str) -> Option<char> {
 
 fn is_audio_input_label(label: &str) -> bool {
     label == loc::t("AudioInput") || label.eq_ignore_ascii_case("input")
+}
+
+/// Vertical advance (physical px) of one `FlyoutBlock` in both `layout_flyout` and `paint`.
+/// Keeping layout and viewport culling on a single helper ensures culled rows stay pixel-exact.
+#[must_use]
+fn block_height_px(block: &FlyoutBlock, dpi: f32) -> i32 {
+    let s = |v: f32| (v * dpi).round() as i32;
+    match block {
+        FlyoutBlock::Hero { caption, large, .. } => {
+            let val_h = if *large { s(46.0) } else { s(34.0) };
+            val_h + if caption.is_some() { s(22.0) } else { s(6.0) }
+        }
+        FlyoutBlock::HeroHeader { .. } => s(52.0),
+        FlyoutBlock::CalendarGrid { .. } => s(30.0) + s(8.0) + s(20.0) + 6 * s(32.0) + s(6.0),
+        FlyoutBlock::AudioSliderSection { .. } => s(22.0) + s(32.0) + s(8.0) + s(24.0),
+        FlyoutBlock::MetricTiles(tiles) => {
+            let rows = tiles.len().div_ceil(2) as i32;
+            rows * s(48.0) + (rows - 1).max(0) * s(8.0) + s(6.0)
+        }
+        FlyoutBlock::BadgeRow { .. } => s(38.0) + s(4.0),
+        FlyoutBlock::StatusHeader { .. } => s(28.0) + s(6.0),
+        FlyoutBlock::ToggleGrid(tiles) => {
+            let rows = tiles.len().div_ceil(2) as i32;
+            rows * s(52.0) + (rows - 1).max(0) * s(8.0) + s(6.0)
+        }
+        FlyoutBlock::IconToggleGrid(tiles) => {
+            let rows = tiles.len().div_ceil(2) as i32;
+            rows * s(56.0) + (rows - 1).max(0) * s(8.0) + s(6.0)
+        }
+        FlyoutBlock::GlyphStatRow { .. } => s(30.0),
+        FlyoutBlock::GlyphActionRow { subtitle, .. } => {
+            (if subtitle.is_some() { s(44.0) } else { s(38.0) }) + s(5.0)
+        }
+        FlyoutBlock::StatRow { .. } => s(24.0),
+        FlyoutBlock::ProgressBar {
+            label, value_text, ..
+        } => {
+            if label.is_empty() && value_text.is_empty() {
+                s(16.0)
+            } else {
+                s(34.0)
+            }
+        }
+        FlyoutBlock::ActionRow { subtitle, .. } => {
+            (if subtitle.is_some() { s(42.0) } else { s(34.0) }) + s(4.0)
+        }
+        FlyoutBlock::AppRow { .. } => s(42.0) + s(3.0),
+        FlyoutBlock::ButtonBar(_) => s(34.0) + s(6.0),
+        FlyoutBlock::SeekSlider { .. } => s(44.0),
+        FlyoutBlock::TextInput { .. } => s(56.0),
+        FlyoutBlock::Chart { .. } => s(80.0),
+        FlyoutBlock::Image { size_dips, .. } => s(image_size_dips(*size_dips)) + s(8.0),
+        FlyoutBlock::IconBar { buttons } => {
+            if buttons.is_empty() {
+                0
+            } else {
+                let cols = buttons.len().min(4) as i32;
+                let rows = buttons.len().div_ceil(cols as usize) as i32;
+                rows * s(48.0) + (rows - 1).max(0) * s(6.0) + s(6.0)
+            }
+        }
+        FlyoutBlock::Separator => s(14.0),
+        FlyoutBlock::Note(_) => s(24.0),
+    }
+}
+
+/// Returns `true` when a block spanning `[block_top, block_bottom)` overlaps the
+/// visible scroll clip `[clip_top, clip_bottom)`. Offscreen rows are skipped during paint.
+#[must_use]
+fn block_intersects_viewport(
+    block_top: i32,
+    block_bottom: i32,
+    clip_top: i32,
+    clip_bottom: i32,
+) -> bool {
+    block_bottom > clip_top && block_top < clip_bottom
 }
 
 /// Computes the layout height and content-space hit targets for `spec`.
@@ -1372,6 +1463,82 @@ impl MenuClassProbe {
     }
 }
 
+/// Thread-safe handle allowing a background worker to wake an open live flyout
+/// (`show_flyout_live_with_options`) and dispatch `LiveEvent::Update` on its UI
+/// thread immediately without polling.
+#[derive(Clone)]
+pub struct LiveUpdateHandle {
+    inner: Arc<LiveUpdateSignal>,
+}
+
+struct LiveUpdateSignal {
+    hwnd: AtomicUsize,
+    pending: AtomicBool,
+    closed: AtomicBool,
+}
+
+impl Default for LiveUpdateHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LiveUpdateHandle {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(LiveUpdateSignal {
+                hwnd: AtomicUsize::new(0),
+                pending: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Signals that new live data is ready. If the flyout window is already attached,
+    /// posts `WM_APP_LIVE_UPDATE`; otherwise leaves `pending` armed so `attach` fires it
+    /// as soon as the window is created.
+    pub fn notify(&self) {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.inner.pending.store(true, Ordering::SeqCst);
+        let hwnd = self.inner.hwnd.load(Ordering::SeqCst);
+        if hwnd != 0 && !self.inner.closed.load(Ordering::SeqCst) {
+            unsafe {
+                let _ = PostMessageW(hwnd as HWND, WM_APP_LIVE_UPDATE, 0, 0);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire)
+    }
+
+    fn attach(&self, hwnd: usize) {
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.inner.hwnd.store(hwnd, Ordering::SeqCst);
+        if self.inner.pending.load(Ordering::SeqCst) && hwnd != 0 {
+            unsafe {
+                let _ = PostMessageW(hwnd as HWND, WM_APP_LIVE_UPDATE, 0, 0);
+            }
+        }
+    }
+
+    fn clear_pending(&self) {
+        self.inner.pending.store(false, Ordering::SeqCst);
+    }
+
+    pub fn detach(&self) {
+        self.inner.closed.store(true, Ordering::SeqCst);
+        self.inner.hwnd.store(0, Ordering::SeqCst);
+        self.inner.pending.store(false, Ordering::SeqCst);
+    }
+}
+
 thread_local! {
     /// UI-thread-only cache: the low-level hook never touches this (it only
     /// posts coordinates), so a hung foreign window cannot stall system input.
@@ -1379,6 +1546,8 @@ thread_local! {
     /// Optional physical-pixel widget rect that opened the next flyout via hover.
     /// Consumed once by `show_flyout_impl` to arm hover-leave auto-dismiss.
     static NEXT_HOVER_ANCHOR: RefCell<Option<RECT>> = const { RefCell::new(None) };
+    /// Optional async wakeup handle consumed once by the next live `show_flyout_impl`.
+    static NEXT_LIVE_UPDATE_HANDLE: RefCell<Option<LiveUpdateHandle>> = const { RefCell::new(None) };
 }
 
 /// Arms (or clears) hover-leave auto-dismiss for the next flyout opened on this UI thread.
@@ -1390,6 +1559,13 @@ pub fn set_next_hover_anchor(rect: Option<(i32, i32, i32, i32)>) {
             right,
             bottom,
         });
+    });
+}
+
+/// Binds an async wakeup handle to the next live flyout opened on this UI thread.
+pub fn set_next_live_update_handle(handle: Option<LiveUpdateHandle>) {
+    NEXT_LIVE_UPDATE_HANDLE.with(|slot| {
+        *slot.borrow_mut() = handle;
     });
 }
 
@@ -1484,7 +1660,11 @@ fn show_flyout_impl<'a>(
     border: BorderStyle,
     options: FlyoutOptions,
 ) -> Option<FlyoutAction> {
+    let live_update = NEXT_LIVE_UPDATE_HANDLE.with(|slot| slot.borrow_mut().take());
     if should_suppress_reopen(tag) {
+        if let Some(handle) = live_update {
+            handle.detach();
+        }
         return None;
     }
 
@@ -1551,7 +1731,8 @@ fn show_flyout_impl<'a>(
         margin,
     );
     // A journaled position wins over the computed placement, unless the caller passed
-    // an explicit dock/island anchor (a stale saved spot must not move it away).
+    // an explicit dock/island anchor (a stale saved spot must not move it away, and
+    // anchored flyouts skip synchronous journal disk read/write entirely).
     let (x, top_y) = if options.use_anchor_position {
         (x, top_y)
     } else {
@@ -1559,11 +1740,13 @@ fn show_flyout_impl<'a>(
         let top = screen.top + margin;
         let max_x = (screen.right - width_px - margin).max(left);
         let max_y = (screen.bottom - height_px - margin).max(top);
-        opentaskbar_shell::flyout_journal::read_tag(tag).map_or((x, top_y), |(sx, sy)| {
-            (sx.clamp(left, max_x), sy.clamp(top, max_y))
-        })
+        let pos = opentaskbar_shell::flyout_journal::read_tag(tag)
+            .map_or((x, top_y), |(sx, sy)| {
+                (sx.clamp(left, max_x), sy.clamp(top, max_y))
+            });
+        opentaskbar_shell::flyout_journal::write_tag(tag, pos.0, pos.1);
+        pos
     };
-    opentaskbar_shell::flyout_journal::write_tag(tag, x, top_y);
 
     let animate = win32::client_area_animations_enabled()
         && FLYOUT_ANIMATIONS_ENABLED.load(Ordering::Relaxed);
@@ -1593,6 +1776,9 @@ fn show_flyout_impl<'a>(
         )
     };
     if hwnd.is_null() {
+        if let Some(handle) = live_update {
+            handle.detach();
+        }
         return None;
     }
 
@@ -1655,6 +1841,13 @@ fn show_flyout_impl<'a>(
         dpi,
         is_dark,
         spec,
+        anchor_x_px: anchor_center_x_px,
+        anchor_y_px: anchor_bottom_y_px,
+        edge: options.edge,
+        use_anchor_position: options.use_anchor_position,
+        screen,
+        width_px,
+        height_px,
         x_px: x,
         target_y_px: top_y,
         slide_px,
@@ -1668,10 +1861,12 @@ fn show_flyout_impl<'a>(
         shadow_rings: options.shadow_rings.min(8),
         on_secondary,
         on_live,
+        live_update,
         tick_enabled,
         border,
         spatial_glass,
         dcomp_fg,
+        icon_bitmaps: D2dIconBitmapCache::default(),
         content_top_px,
         viewport_h_px,
         content_h_px,
@@ -1712,6 +1907,9 @@ fn show_flyout_impl<'a>(
             SetTimer(hwnd, TIMER_LIVE, LIVE_TICK_MS, None);
         }
     }
+    if let Some(ref handle) = state.live_update {
+        handle.attach(hwnd as usize);
+    }
 
     if options.retain_for_external_context_menu {
         HOOK_TARGET.store(hwnd as usize, Ordering::Release);
@@ -1746,6 +1944,10 @@ fn show_flyout_impl<'a>(
     }
     HOOK_TARGET.store(0, Ordering::Release);
     EXTERNAL_MENU_ACTIVE.store(false, Ordering::Release);
+    if let Some(ref handle) = state.live_update {
+        handle.detach();
+    }
+    state.icon_bitmaps.clear();
     state.dcomp_fg = None;
     state.spatial_glass = None;
     unsafe {
@@ -1781,12 +1983,76 @@ impl FlyoutState<'_> {
     fn apply_live_spec(&mut self, next: FlyoutSpec) {
         let mut client = RECT::default();
         unsafe { GetClientRect(self.hwnd, &mut client) };
-        let width_px = client.right.max(1);
+        let width_px = client.right.max(self.width_px).max(1);
         let (ct, ch, targets) = layout_flyout(&next, width_px, self.dpi);
+        let s = |v: f32| (v * self.dpi).round() as i32;
+        let pad = s(FLYOUT_PAD_DIPS);
+        let margin = s(10.0);
+        let available_h = flyout_available_height(
+            self.edge,
+            self.use_anchor_position,
+            &self.screen,
+            self.anchor_y_px,
+            margin,
+            s(160.0),
+        );
+        let new_height_px = (ct + ch + pad).min(s(MAX_FLYOUT_H_DIPS)).min(available_h);
         self.spec = next;
         self.content_top_px = ct;
         self.content_h_px = ch;
+        self.viewport_h_px = (new_height_px - ct - pad).max(1);
         self.targets = targets;
+        if new_height_px != self.height_px {
+            self.height_px = new_height_px;
+            if self.use_anchor_position {
+                let (nx, ny) = flyout_origin(
+                    self.edge,
+                    &self.screen,
+                    self.anchor_x_px,
+                    self.anchor_y_px,
+                    width_px,
+                    new_height_px,
+                    margin,
+                );
+                self.x_px = nx;
+                self.target_y_px = ny;
+            } else {
+                let top = self.screen.top + margin;
+                let max_y = (self.screen.bottom - new_height_px - margin).max(top);
+                self.target_y_px = self.target_y_px.clamp(top, max_y);
+            }
+            let cur_y = if self.animating && !self.closing && self.slide_px != 0 {
+                let elapsed = self.anim_start.elapsed().as_secs_f32() * 1000.0;
+                let t = (elapsed / OPEN_ANIM_MS).clamp(0.0, 1.0);
+                let eased = 1.0 - (1.0 - t).powi(3);
+                self.target_y_px + ((1.0 - eased) * self.slide_px as f32).round() as i32
+            } else {
+                self.target_y_px
+            };
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    std::ptr::null_mut(),
+                    self.x_px,
+                    cur_y,
+                    width_px,
+                    new_height_px,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            if let Some(ref mut glass) = self.spatial_glass {
+                glass.sync_rect(
+                    0.0,
+                    0.0,
+                    width_px as f32,
+                    new_height_px as f32,
+                    (8.0 * self.dpi).round(),
+                    self.dpi,
+                    0.0,
+                    0.0,
+                );
+            }
+        }
         self.scroll_y = self.scroll_y.clamp(0, self.max_scroll());
         unsafe {
             InvalidateRect(self.hwnd, std::ptr::null(), 0);
@@ -1907,6 +2173,9 @@ impl FlyoutState<'_> {
             return;
         }
         self.closing = true;
+        if let Some(ref handle) = self.live_update {
+            handle.detach();
+        }
         // Arm reopen suppression immediately when dismissal starts so a fast
         // click releasing during `CLOSE_ANIM_MS` cannot reopen the flyout.
         if self.selected.is_none() && !self.recorded_close {
@@ -2046,6 +2315,7 @@ impl FlyoutState<'_> {
         let scroll_y = self.scroll_y;
         let max_s = self.max_scroll();
         let spatial_glass = &mut self.spatial_glass;
+        let icon_bitmaps = &mut self.icon_bitmaps;
         let _ = self.shadow_rings;
 
         let pal = design::active_palette_with_border(is_dark, Some(border.rgb));
@@ -2211,20 +2481,22 @@ impl FlyoutState<'_> {
                 }
             }
 
+            let clip_top = content_top_px;
+            let clip_bottom = content_top_px + viewport_h_px;
             unsafe {
                 d2d.target().PushAxisAlignedClip(
-                    &d2d_rect(
-                        0.0,
-                        content_top_px as f32,
-                        wf,
-                        (content_top_px + viewport_h_px) as f32,
-                    ),
+                    &d2d_rect(0.0, clip_top as f32, wf, clip_bottom as f32),
                     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                 );
             }
 
             let mut y = content_top_px - scroll_y;
             for block in &spec.blocks {
+                let block_h = block_height_px(block, dpi);
+                if !block_intersects_viewport(y, y + block_h, clip_top, clip_bottom) {
+                    y += block_h;
+                    continue;
+                }
                 let yf = y as f32;
                 match block {
                     FlyoutBlock::Hero {
@@ -3325,7 +3597,8 @@ impl FlyoutState<'_> {
                         if let Some(ic) = icon {
                             let isz = sf(18.0);
                             let iy = yf + (hf - isz) * 0.5;
-                            d2d.draw_bgra_bitmap(
+                            icon_bitmaps.draw_bgra(
+                                d2d,
                                 ic.width,
                                 ic.height,
                                 &ic.bgra,
@@ -3405,7 +3678,8 @@ impl FlyoutState<'_> {
                         let icon_x = app.left as f32;
                         let icon_y = yf + ((app.bottom - y) as f32 - icon_size) * 0.5;
                         if let Some(icon) = icon {
-                            d2d.draw_bgra_bitmap(
+                            icon_bitmaps.draw_bgra(
+                                d2d,
                                 icon.width,
                                 icon.height,
                                 &icon.bgra,
@@ -4006,6 +4280,15 @@ unsafe extern "system" fn flyout_wnd_proc(
         }
         WM_TIMER if wparam == TIMER_LIVE => {
             state.dispatch_live_tick();
+            0
+        }
+        WM_APP_LIVE_UPDATE => {
+            if let Some(ref handle) = state.live_update {
+                handle.clear_pending();
+            }
+            if live_tick_allowed(state.closing, state.on_live.is_some()) {
+                state.dispatch_live(LiveEvent::Update);
+            }
             0
         }
         WM_TIMER if wparam == TIMER_DISMISS => {
@@ -4816,5 +5099,105 @@ mod tests {
         assert_eq!(labels, ["Paz", "Pzt", "Sal", "Çar", "Per", "Cum", "Cmt"]);
         let unique: std::collections::HashSet<&str> = labels.iter().map(String::as_str).collect();
         assert_eq!(unique.len(), 7);
+    }
+
+    #[test]
+    fn viewport_culling_skips_offscreen_rows_and_keeps_visible_rows() {
+        // Clip viewport spans [100, 300).
+        let (clip_top, clip_bottom) = (100, 300);
+        // Completely above viewport (including exact touch at bottom == clip_top).
+        assert!(!super::block_intersects_viewport(
+            0,
+            60,
+            clip_top,
+            clip_bottom
+        ));
+        assert!(!super::block_intersects_viewport(
+            60,
+            100,
+            clip_top,
+            clip_bottom
+        ));
+        // Completely below viewport (including exact touch at top == clip_bottom).
+        assert!(!super::block_intersects_viewport(
+            300,
+            340,
+            clip_top,
+            clip_bottom
+        ));
+        assert!(!super::block_intersects_viewport(
+            350,
+            400,
+            clip_top,
+            clip_bottom
+        ));
+        // Partially overlapping top, fully inside, and partially overlapping bottom.
+        assert!(super::block_intersects_viewport(
+            80,
+            110,
+            clip_top,
+            clip_bottom
+        ));
+        assert!(super::block_intersects_viewport(
+            120,
+            160,
+            clip_top,
+            clip_bottom
+        ));
+        assert!(super::block_intersects_viewport(
+            280,
+            320,
+            clip_top,
+            clip_bottom
+        ));
+        // Spanning the entire viewport.
+        assert!(super::block_intersects_viewport(
+            50,
+            350,
+            clip_top,
+            clip_bottom
+        ));
+
+        // Verify `block_height_px` stays in exact lockstep with `layout_flyout` across a
+        // 40-row scrollable folder stack and that culling skips offscreen rows cleanly.
+        let blocks: Vec<FlyoutBlock> = (0..40u32)
+            .map(|i| FlyoutBlock::ActionRow {
+                id: 100 + i,
+                title: format!("Item {i}"),
+                subtitle: (i < 5).then(|| "Folder".to_owned()),
+                badge: None,
+                icon: None,
+                destructive: false,
+            })
+            .collect();
+        let spec = FlyoutSpec {
+            title: "Downloads".to_owned(),
+            subtitle: Some(r"C:\Users\Me\Downloads".to_owned()),
+            width_dips: 320.0,
+            blocks,
+        };
+        let (content_top, content_h, _) = layout_flyout(&spec, 320, 1.0);
+        let summed_h: i32 = spec
+            .blocks
+            .iter()
+            .map(|b| super::block_height_px(b, 1.0))
+            .sum();
+        assert_eq!(summed_h, content_h);
+
+        let viewport_h = 300;
+        let scroll_y = 400;
+        let mut y = content_top - scroll_y;
+        let mut visible = 0usize;
+        for block in &spec.blocks {
+            let h = super::block_height_px(block, 1.0);
+            if super::block_intersects_viewport(y, y + h, content_top, content_top + viewport_h) {
+                visible += 1;
+            }
+            y += h;
+        }
+        assert!(
+            visible > 0 && visible < 12,
+            "expected ~8-10 visible rows, got {visible}"
+        );
     }
 }

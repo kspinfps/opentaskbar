@@ -23,7 +23,7 @@ use crate::platform::win32_helpers::set_window_long_ptr;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -108,7 +108,10 @@ use crate::platform::win32::{
     self, AppContextAction, ContextAction, MonitorInfo, RecycleBinAction, TaskViewAction,
     WidgetContextAction,
 };
-use crate::ui::flyout::{FlyoutBlock, FlyoutEdge, FlyoutIcon, FlyoutOptions, FlyoutSpec};
+use crate::ui::flyout::{
+    FlyoutBlock, FlyoutEdge, FlyoutIcon, FlyoutOptions, FlyoutSpec, LiveEvent, LiveOutcome,
+    LiveUpdateHandle,
+};
 use crate::ui::menu::{self, BorderStyle, MenuEntry};
 use crate::ui::settings as settings_ui;
 use crate::widgets::{self, HOVER_INTENT_MS, HoverChange, HoverPhase, WidgetRuntime, registry};
@@ -182,6 +185,13 @@ const ALL_HOTKEY_IDS: [i32; 6] = [
 /// Smart OCR / quick screenshot workers finished: the UI thread drains
 /// `SMART_CAPTURE_RESULTS` and shows the confirmation HUD on the island.
 const WM_APP_SMART_CAPTURE_DONE: u32 = WM_APP + 0x21;
+/// Background folder snapshot scan finished; drained into `DockState::folder_snapshots`.
+const WM_APP_FOLDER_SNAPSHOT: u32 = WM_APP + 0x22;
+/// Folder snapshot cache TTL for stack hover tooltips and instant stack flyout opens.
+const FOLDER_SNAPSHOT_TTL: Duration = Duration::from_secs(15);
+/// Maximum retries after an initial icon extraction miss (`1.5s -> 5s -> 15s -> 45s`).
+const ICON_RETRY_MAX_ATTEMPTS: u8 = 4;
+const ICON_RETRY_BACKOFF_MS: [u64; 4] = [1_500, 5_000, 15_000, 45_000];
 /// Integration menu ids live above every dock/app menu id so a native command
 /// can never be mistaken for a dock context action.
 const NATIVE_APP_MENU_ID_BASE: u32 = 7000;
@@ -467,9 +477,219 @@ fn read_stack_entries(path: &str) -> Option<Vec<layout::StackEntry>> {
     Some(out)
 }
 
-/// Number of visible items in a folder stack (tooltip suffix).
-fn stack_item_count(path: &str) -> Option<usize> {
-    read_stack_entries(path).map(|entries| entries.len())
+/// Canonical string key for a folder stack path (pure string normalization, zero disk I/O).
+fn canonical_folder_key(path: &str) -> String {
+    path.trim()
+        .trim_end_matches(['\\', '/'])
+        .to_ascii_lowercase()
+}
+
+#[derive(Clone, Debug)]
+struct FolderSnapshot {
+    entries: Option<Vec<layout::StackEntry>>,
+    total_count: Option<usize>,
+    refreshed_at: Instant,
+    in_flight: bool,
+}
+
+impl FolderSnapshot {
+    fn is_fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.refreshed_at) < FOLDER_SNAPSHOT_TTL
+    }
+}
+
+struct FolderSnapshotResult {
+    key: String,
+    generation: u64,
+    entries: Option<Vec<layout::StackEntry>>,
+    total_count: usize,
+    refreshed_at: Instant,
+}
+
+/// In-memory cache of folder stack snapshots keyed by canonical folder path.
+/// Keeps hover tooltips and stack flyout opens 100% free of synchronous `read_dir`.
+#[derive(Default)]
+struct FolderSnapshotCache {
+    entries: HashMap<String, FolderSnapshot>,
+    generations: HashMap<String, u64>,
+    in_flight_gens: HashMap<String, u64>,
+}
+
+impl FolderSnapshotCache {
+    fn generation(&self, path: &str) -> u64 {
+        let key = canonical_folder_key(path);
+        self.generations.get(&key).copied().unwrap_or(0)
+    }
+
+    fn get(&self, path: &str) -> Option<&FolderSnapshot> {
+        let key = canonical_folder_key(path);
+        self.entries.get(&key)
+    }
+
+    fn mark_in_flight(&mut self, path: &str) -> Option<u64> {
+        let key = canonical_folder_key(path);
+        let scan_gen = self.generations.get(&key).copied().unwrap_or(0);
+        if self.in_flight_gens.get(&key).copied() == Some(scan_gen) {
+            return None;
+        }
+        self.in_flight_gens.insert(key.clone(), scan_gen);
+        if let Some(snap) = self.entries.get_mut(&key) {
+            snap.in_flight = true;
+        }
+        Some(scan_gen)
+    }
+
+    fn clear_in_flight(&mut self, path: &str, scan_gen: u64) {
+        let key = canonical_folder_key(path);
+        if self.in_flight_gens.get(&key).copied() == Some(scan_gen) {
+            self.in_flight_gens.remove(&key);
+            if let Some(snap) = self.entries.get_mut(&key) {
+                snap.in_flight = false;
+            }
+        }
+    }
+
+    fn complete(&mut self, result: FolderSnapshotResult) -> bool {
+        let current_gen = self.generations.get(&result.key).copied().unwrap_or(0);
+        if result.generation != current_gen {
+            return false;
+        }
+        if self.in_flight_gens.get(&result.key).copied() == Some(result.generation) {
+            self.in_flight_gens.remove(&result.key);
+        }
+        let (entries, total_count) = match result.entries {
+            Some(entries) => (Some(entries), Some(result.total_count)),
+            None => (None, None),
+        };
+        self.entries.insert(
+            result.key,
+            FolderSnapshot {
+                entries,
+                total_count,
+                refreshed_at: result.refreshed_at,
+                in_flight: false,
+            },
+        );
+        true
+    }
+
+    fn invalidate(&mut self, path: &str) {
+        let key = canonical_folder_key(path);
+        let next_gen = self
+            .generations
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        self.generations.insert(key.clone(), next_gen);
+        self.entries.remove(&key);
+        self.in_flight_gens.remove(&key);
+    }
+}
+
+/// Stable row-ID table for an open stack flyout so an async refresh arriving
+/// mid-open never shifts IDs or launches the wrong file.
+struct StackRowIds {
+    next_id: u32,
+    by_path: HashMap<String, u32>,
+    by_id: HashMap<u32, PathBuf>,
+}
+
+impl StackRowIds {
+    fn new() -> Self {
+        Self {
+            next_id: STACK_FLYOUT_ROW_ID_BASE,
+            by_path: HashMap::new(),
+            by_id: HashMap::new(),
+        }
+    }
+
+    fn id_for(&mut self, path: &str) -> u32 {
+        let key = path.to_ascii_lowercase();
+        if let Some(&id) = self.by_path.get(&key) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.by_path.insert(key, id);
+        self.by_id.insert(id, PathBuf::from(path));
+        id
+    }
+
+    fn path_for(&self, id: u32) -> Option<&Path> {
+        self.by_id.get(&id).map(PathBuf::as_path)
+    }
+}
+
+enum StackHydrationMsg {
+    Snapshot(Vec<layout::StackEntry>),
+    Icons(HashMap<String, (u32, u32, Vec<u8>)>),
+}
+
+fn flyout_icon_from_tuple((width, height, bgra): (u32, u32, Vec<u8>)) -> FlyoutIcon {
+    FlyoutIcon {
+        width,
+        height,
+        bgra,
+    }
+}
+
+fn build_stack_flyout_spec(
+    label: &str,
+    path: &str,
+    entries: Option<&[layout::StackEntry]>,
+    resolved_icons: &HashMap<String, FlyoutIcon>,
+    row_ids: &mut StackRowIds,
+) -> FlyoutSpec {
+    let mut blocks = Vec::with_capacity(entries.map_or(3, |list| list.len() + 3));
+    match entries {
+        None => {
+            blocks.push(FlyoutBlock::Note(localized_or("Loading", "Loading...")));
+        }
+        Some([]) => {
+            blocks.push(FlyoutBlock::Note(loc::t("StackEmpty")));
+        }
+        Some(shown) => {
+            for entry in shown {
+                let icon = resolved_icons
+                    .get(&entry.path)
+                    .cloned()
+                    .or_else(|| {
+                        icon_cache::lookup_memory_cached(&entry.path, icon_cache::ICON_PX)
+                            .map(flyout_icon_from_tuple)
+                    })
+                    .or_else(|| {
+                        icon_cache::instant_generic_icon_for_path(
+                            Path::new(&entry.path),
+                            entry.is_dir,
+                        )
+                        .map(flyout_icon_from_tuple)
+                    });
+                blocks.push(FlyoutBlock::ActionRow {
+                    id: row_ids.id_for(&entry.path),
+                    // `T3 Code (Beta).lnk` reads as `T3 Code (Beta)`; launching
+                    // still uses `entry.path` (the full shortcut path).
+                    title: stack_entry_display_name(&entry.name),
+                    subtitle: entry.is_dir.then(|| loc::t("FolderLabel")),
+                    badge: None,
+                    icon,
+                    destructive: false,
+                });
+            }
+        }
+    }
+    blocks.push(FlyoutBlock::Separator);
+    blocks.push(FlyoutBlock::ButtonBar(vec![(
+        STACK_FLYOUT_OPEN_FOLDER_ID,
+        loc::t("OpenFolderInExplorer"),
+        false,
+    )]));
+    FlyoutSpec {
+        title: label.to_owned(),
+        subtitle: Some(path.to_owned()),
+        width_dips: 320.0,
+        blocks,
+    }
 }
 
 fn open_folder_in_explorer(path: &str) {
@@ -840,10 +1060,9 @@ struct StackVisual {
     icon: VisualNode,
     bound_source: String,
     bound_has_icon: bool,
+    bound_surface_gen: u64,
     scale: f32,
     scale_velocity: f32,
-    /// `(read_at, visible item count)` for the hover tooltip (2 s TTL).
-    cached_count: Option<(Instant, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1024,7 +1243,10 @@ struct DockSlot {
     pinned: bool,
     label: String,
     launch_path: String,
+    aumid: Option<String>,
     icon_source: String,
+    icon_candidates: Vec<String>,
+    rep_hwnd: Option<isize>,
     windows: Vec<PreviewItem>,
     is_foreground: bool,
     scale: f32,
@@ -1070,6 +1292,7 @@ struct SlotVisuals {
     badge_count: u32,
     bound_source: String,
     bound_has_icon: bool,
+    bound_surface_gen: u64,
     bound_dot_state: u8,
     fading: bool,
 }
@@ -1079,6 +1302,7 @@ struct TrayPinVisual {
     icon: VisualNode,
     source: String,
     has_icon: bool,
+    bound_surface_gen: u64,
     label: String,
 }
 
@@ -1088,7 +1312,95 @@ struct TooltipCache {
     height_dips: f32,
 }
 
-type IconBatchQueue = Arc<Mutex<Vec<HashMap<String, Option<RawIcon>>>>>;
+#[derive(Clone)]
+struct LoadedIconSurface {
+    surface: IDCompositionSurface,
+    generation: u64,
+    /// When > 0, a lower-priority cached fallback candidate is displayed while
+    /// higher-priority candidates `candidates[..upgrade_prefix_len]` still qualify
+    /// for background extraction/upgrade.
+    upgrade_prefix_len: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum IconCacheProbe<T> {
+    PrimaryHit(T),
+    FallbackHit {
+        surface: T,
+        upgrade_prefix_len: usize,
+    },
+    Miss,
+}
+
+fn probe_cached_icon_candidates<T>(
+    candidates: &[String],
+    mut lookup: impl FnMut(&str) -> Option<T>,
+) -> IconCacheProbe<T> {
+    for (idx, cand) in candidates.iter().enumerate() {
+        if let Some(surface) = lookup(cand) {
+            return if idx == 0 {
+                IconCacheProbe::PrimaryHit(surface)
+            } else {
+                IconCacheProbe::FallbackHit {
+                    surface,
+                    upgrade_prefix_len: idx,
+                }
+            };
+        }
+    }
+    IconCacheProbe::Miss
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IconRetryState {
+    attempts: u8,
+    next_retry: Instant,
+    signature: Vec<String>,
+}
+
+fn icon_retry_backoff(attempts: u8) -> Duration {
+    let idx = usize::from(attempts.saturating_sub(1)).min(ICON_RETRY_BACKOFF_MS.len() - 1);
+    Duration::from_millis(ICON_RETRY_BACKOFF_MS[idx])
+}
+
+impl IconRetryState {
+    fn should_attempt(existing: Option<&Self>, signature: &[String], now: Instant) -> bool {
+        let Some(state) = existing else {
+            return true;
+        };
+        if state.signature != signature {
+            return true;
+        }
+        state.attempts <= ICON_RETRY_MAX_ATTEMPTS && now >= state.next_retry
+    }
+
+    fn record_failure(existing: Option<&Self>, signature: Vec<String>, now: Instant) -> Self {
+        let prev_attempts = existing
+            .filter(|state| state.signature == signature)
+            .map_or(0, |state| state.attempts);
+        let attempts = prev_attempts.saturating_add(1);
+        Self {
+            attempts,
+            next_retry: now + icon_retry_backoff(attempts),
+            signature,
+        }
+    }
+}
+
+struct IconLoadRequest {
+    key: String,
+    candidates: Vec<String>,
+    rep_hwnd: Option<isize>,
+}
+
+struct IconLoadResult {
+    key: String,
+    signature: Vec<String>,
+    icon: Option<RawIcon>,
+}
+
+type IconBatchQueue = Arc<Mutex<Vec<Vec<IconLoadResult>>>>;
+type FolderSnapshotQueue = Arc<Mutex<Vec<FolderSnapshotResult>>>;
 type DipRect = (f32, f32, f32, f32);
 
 struct DockState {
@@ -1151,6 +1463,9 @@ struct DockState {
     widget_visuals: Vec<WidgetVisual>,
     /// One native folder icon per `settings.stack_folders` entry (none on a light strip).
     stack_visuals: Vec<StackVisual>,
+    /// Shared in-memory folder snapshot cache (zero synchronous `read_dir` on hover/click).
+    folder_snapshots: FolderSnapshotCache,
+    pending_folder_snapshots: FolderSnapshotQueue,
     /// `imageres.dll,-3` folder icon used until a stack's own icon resolves.
     folder_fallback_surf: Option<IDCompositionSurface>,
     hovered_stack: Option<usize>,
@@ -1179,13 +1494,15 @@ struct DockState {
     show_desktop_corner: Option<ShowDesktopCorner>,
     dot_running: IDCompositionSurface,
     dot_active: IDCompositionSurface,
-    icon_surfaces: HashMap<String, Option<IDCompositionSurface>>,
+    icon_surfaces: HashMap<String, LoadedIconSurface>,
+    next_icon_surface_gen: u64,
+    icon_retries: HashMap<String, IconRetryState>,
     fallback_surfaces: HashMap<String, IDCompositionSurface>,
     in_flight_icons: HashSet<String>,
     pending_icons: IconBatchQueue,
     slot_visuals: Vec<SlotVisuals>,
     drag_ghost: VisualNode,
-    drag_ghost_source: Option<String>,
+    drag_ghost_source: Option<(String, u64)>,
     tooltip_node: VisualNode,
     tooltip_cache: Option<TooltipCache>,
     preview: Option<Box<PreviewPopup>>,
@@ -1328,13 +1645,19 @@ fn folder_stack_preview_count(path: &str) -> Option<usize> {
     Some(folder_stack_preview_cells(visible).len())
 }
 
-fn load_effective_pins(settings: &DockSettings) -> Vec<PinnedApp> {
-    let mut items = pins::load_pins();
+fn merge_user_pins(
+    items: &mut Vec<PinnedApp>,
+    settings: &DockSettings,
+    mut resolve_pin: impl FnMut(&str) -> Option<PinnedApp>,
+) {
     for extra_path in &settings.user_pinned_apps {
-        let exists = items
-            .iter()
-            .any(|p| p.launch_path.eq_ignore_ascii_case(extra_path));
-        if !exists && let Some(pin) = pins::pin_from_path(extra_path) {
+        let exists = items.iter().any(|p| pins::spec_matches_pin(extra_path, p));
+        if !exists
+            && let Some(pin) = resolve_pin(extra_path)
+            && !items
+                .iter()
+                .any(|existing| pins::pins_share_identity(existing, &pin))
+        {
             items.push(pin);
         }
     }
@@ -1343,9 +1666,14 @@ fn load_effective_pins(settings: &DockSettings) -> Vec<PinnedApp> {
             !settings
                 .user_unpinned_apps
                 .iter()
-                .any(|u| u.eq_ignore_ascii_case(&p.launch_path))
+                .any(|u| pins::spec_matches_pin(u, p))
         });
     }
+}
+
+fn load_effective_pins(settings: &DockSettings) -> Vec<PinnedApp> {
+    let mut items = pins::load_pins();
+    merge_user_pins(&mut items, settings, pins::pin_from_path);
     if let Some(ref order) = settings.pin_order {
         items.sort_by_key(|p| {
             order
@@ -1387,23 +1715,488 @@ fn update_background_pin(settings: &mut DockSettings, path: &str, pinned: bool) 
     }
 }
 
-/// Groups running windows the way `RunningAppProjection` does: by AUMID when
-/// available, falling back to the executable for shared hosts / missing AUMIDs.
-/// `AggregateByExecutablePath` forces executable grouping for every window.
-pub fn running_group_key(win: &RunningWindow, aggregate_by_exe: bool) -> String {
-    let exe = win.exe_path.to_lowercase();
-    let shared_host = [
-        "explorer.exe",
-        "applicationframehost.exe",
-        "systemsettings.exe",
-    ]
-    .iter()
-    .any(|host| exe.ends_with(host));
-    if aggregate_by_exe || shared_host || win.aumid.trim().is_empty() {
-        format!("exe:{exe}")
-    } else {
-        format!("aumid:{}", win.aumid.to_lowercase())
+fn is_frame_host_exe(path: &str) -> bool {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or_default();
+    let file = file.split_once(',').map_or(file, |(name, _)| name.trim());
+    file.eq_ignore_ascii_case("ApplicationFrameHost.exe")
+}
+
+fn apps_folder_aumid_from_spec(spec: &str) -> Option<&str> {
+    const PREFIXES: [&str; 2] = [
+        "shell:AppsFolder\\",
+        "::{4234d49b-0245-4df3-b780-3893943456e1}\\",
+    ];
+    let trimmed = spec.trim();
+    for prefix in PREFIXES {
+        if let Some(head) = trimmed.get(..prefix.len())
+            && head.eq_ignore_ascii_case(prefix)
+        {
+            let rest = trimmed[prefix.len()..].trim();
+            if !rest.is_empty() {
+                return Some(rest);
+            }
+        }
     }
+    None
+}
+
+fn is_apps_folder_aumid(id: &str) -> bool {
+    let trimmed = id.trim();
+    if trimmed.eq_ignore_ascii_case("Microsoft.Windows.Explorer") {
+        return true;
+    }
+    let Some((family, app)) = trimmed.split_once('!') else {
+        return false;
+    };
+    let Some((name, publisher)) = family.rsplit_once('_') else {
+        return false;
+    };
+    !name.is_empty()
+        && publisher.len() == 13
+        && publisher.bytes().all(|c| c.is_ascii_alphanumeric())
+        && !app.is_empty()
+}
+
+fn pin_effective_aumid(pin: &PinnedApp) -> Option<String> {
+    pin.aumid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| apps_folder_aumid_from_spec(&pin.launch_path).map(str::to_owned))
+        .or_else(|| apps_folder_aumid_from_spec(&pin.icon_source).map(str::to_owned))
+        .or_else(|| pins::resolve_windowsapps_aumid(&pin.launch_path))
+        .or_else(|| {
+            pin.target_exe
+                .as_deref()
+                .and_then(pins::resolve_windowsapps_aumid)
+        })
+}
+
+fn best_window_aumid(windows: &[&RunningWindow]) -> Option<String> {
+    windows
+        .iter()
+        .find_map(|w| {
+            let trimmed = w.aumid.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        })
+        .or_else(|| {
+            windows
+                .iter()
+                .find_map(|w| pins::resolve_windowsapps_aumid(&w.exe_path))
+        })
+}
+
+fn best_window_exe<'a>(windows: &[&'a RunningWindow]) -> Option<&'a str> {
+    windows
+        .iter()
+        .map(|w| w.exe_path.trim())
+        .find(|exe| !exe.is_empty() && !is_frame_host_exe(exe))
+        .or_else(|| {
+            windows
+                .iter()
+                .map(|w| w.exe_path.trim())
+                .find(|exe| !exe.is_empty())
+        })
+}
+
+fn representative_hwnd(windows: &[&RunningWindow]) -> Option<isize> {
+    windows
+        .iter()
+        .find(|w| w.is_foreground)
+        .or_else(|| windows.first())
+        .map(|w| w.hwnd as isize)
+}
+
+fn pinned_slot_identity(
+    pin: &PinnedApp,
+    matched_windows: &[&RunningWindow],
+) -> (Option<String>, String, Vec<String>, Option<isize>) {
+    let aumid = pin_effective_aumid(pin).or_else(|| best_window_aumid(matched_windows));
+    let exe_for_icons = pin
+        .target_exe
+        .as_deref()
+        .map(str::trim)
+        .filter(|exe| !exe.is_empty() && !is_frame_host_exe(exe))
+        .or_else(|| best_window_exe(matched_windows))
+        .unwrap_or("");
+    let mut candidates =
+        pins::icon_candidates_for_app(aumid.as_deref(), exe_for_icons, Some(&pin.launch_path));
+    let pin_icon = pin.icon_source.trim();
+    if !pin_icon.is_empty()
+        && !is_frame_host_exe(pin_icon)
+        && !candidates
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(pin_icon))
+    {
+        if candidates
+            .first()
+            .is_some_and(|first| apps_folder_aumid_from_spec(first).is_some())
+        {
+            candidates.insert(1, pin_icon.to_owned());
+        } else {
+            candidates.insert(0, pin_icon.to_owned());
+        }
+    }
+    let icon_source = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| pin.icon_source.clone());
+    (
+        aumid,
+        icon_source,
+        candidates,
+        representative_hwnd(matched_windows),
+    )
+}
+
+fn running_slot_identity(
+    windows: &[&RunningWindow],
+) -> (
+    Option<String>,
+    String,
+    String,
+    String,
+    Vec<String>,
+    Option<isize>,
+) {
+    let rep = windows
+        .iter()
+        .find(|w| !w.aumid.trim().is_empty() && !is_frame_host_exe(&w.exe_path))
+        .or_else(|| windows.iter().find(|w| !w.aumid.trim().is_empty()))
+        .or_else(|| windows.iter().find(|w| w.is_foreground))
+        .or_else(|| windows.first())
+        .copied();
+    let aumid = best_window_aumid(windows);
+    let exe_for_icons = best_window_exe(windows).unwrap_or("");
+    let candidates = pins::icon_candidates_for_app(aumid.as_deref(), exe_for_icons, None);
+    let apps_folder_target = candidates
+        .first()
+        .filter(|first| apps_folder_aumid_from_spec(first).is_some())
+        .cloned()
+        .or_else(|| {
+            aumid
+                .as_deref()
+                .filter(|id| is_apps_folder_aumid(id) || is_frame_host_exe(exe_for_icons))
+                .map(|id| format!(r"shell:AppsFolder\{id}"))
+        });
+    let fallback_exe = rep.map_or("", |w| w.exe_path.as_str());
+    let icon_source = candidates
+        .first()
+        .cloned()
+        .or_else(|| apps_folder_target.clone())
+        .unwrap_or_else(|| fallback_exe.to_owned());
+    let launch_path = apps_folder_target.unwrap_or_else(|| {
+        if !exe_for_icons.is_empty() {
+            exe_for_icons.to_owned()
+        } else {
+            fallback_exe.to_owned()
+        }
+    });
+    let rep_title = rep.map_or("", |w| w.title.trim());
+    let label = if exe_for_icons.is_empty() || is_frame_host_exe(exe_for_icons) {
+        if !rep_title.is_empty() {
+            rep_title.to_owned()
+        } else if let Some(name) = aumid
+            .as_deref()
+            .and_then(pins::resolve_packaged_app)
+            .map(|p| p.name)
+        {
+            name
+        } else {
+            exe_display_name(fallback_exe, rep_title)
+        }
+    } else {
+        exe_display_name(exe_for_icons, rep_title)
+    };
+    (
+        aumid,
+        label,
+        launch_path,
+        icon_source,
+        candidates,
+        representative_hwnd(windows),
+    )
+}
+
+fn slot_pin_target(slot: &DockSlot) -> String {
+    if slot.pinned {
+        return slot.launch_path.clone();
+    }
+    if apps_folder_aumid_from_spec(&slot.launch_path).is_some() {
+        return slot.launch_path.clone();
+    }
+    if let Some(aumid) = slot
+        .aumid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && (is_apps_folder_aumid(aumid)
+            || is_frame_host_exe(&slot.launch_path)
+            || slot
+                .launch_path
+                .to_ascii_lowercase()
+                .contains(r"\windowsapps\"))
+    {
+        return format!(r"shell:AppsFolder\{aumid}");
+    }
+    slot.launch_path.clone()
+}
+
+/// Groups running windows AUMID-first whenever an AppUserModelID is present,
+/// falling back to the normalized executable path for classic Win32 windows.
+/// Never collapses distinct hosted UWP apps onto `ApplicationFrameHost.exe`,
+/// and never collapses windows with empty `exe_path` + empty `aumid` into `"exe:"`.
+/// `AggregateByExecutablePath` forces executable grouping for non-frame-host windows
+/// that have a known executable path.
+pub fn running_group_key(win: &RunningWindow, aggregate_by_exe: bool) -> String {
+    let exe = win.exe_path.trim().to_lowercase();
+    let frame_host = is_frame_host_exe(&win.exe_path);
+    let aumid = win.aumid.trim();
+    if !aumid.is_empty() && (!aggregate_by_exe || frame_host || exe.is_empty()) {
+        format!("aumid:{}", aumid.to_ascii_lowercase())
+    } else if frame_host || exe.is_empty() {
+        // Unattached ApplicationFrameHost window or elevated/restricted window
+        // without an AUMID or readable image path: isolate by HWND so distinct
+        // apps never merge into a bogus `exe:` bucket.
+        format!("hwnd:{}", win.hwnd)
+    } else {
+        format!("exe:{exe}")
+    }
+}
+
+fn pin_real_exe_lower(pin: &PinnedApp) -> Option<String> {
+    pin.target_exe
+        .as_deref()
+        .map(str::trim)
+        .filter(|exe| !exe.is_empty() && !is_frame_host_exe(exe))
+        .or_else(|| {
+            let launch = pin.launch_path.trim();
+            (apps_folder_aumid_from_spec(launch).is_none()
+                && Path::new(launch)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                && !is_frame_host_exe(launch))
+            .then_some(launch)
+        })
+        .map(str::to_lowercase)
+}
+
+/// Stable cache key for a dock slot's icon surface/retry state. When a slot has
+/// no `exe_path` or `aumid` (empty `icon_source`) but does have a live HWND
+/// (e.g., elevated Task Manager), falls back to `"hwnd:<handle>"` so
+/// `extract_hwnd_icon_bgra` still runs and caches cleanly.
+fn slot_icon_key(slot: &DockSlot) -> Option<Cow<'_, str>> {
+    let source = slot.icon_source.trim();
+    if !source.is_empty() {
+        Some(Cow::Borrowed(source))
+    } else {
+        slot.rep_hwnd
+            .filter(|&hwnd| hwnd != 0)
+            .map(|hwnd| Cow::Owned(format!("hwnd:{hwnd}")))
+    }
+}
+
+/// Resolves the real non-host executable path to verify before terminating a window
+/// process ("End task"). Uses the target running window's actual `exe_path` rather
+/// than `slot.launch_path` (which may be `shell:AppsFolder\...` or a `.lnk`), and
+/// always refuses to terminate `ApplicationFrameHost.exe`.
+fn resolve_terminate_exe<'a>(
+    slot: &'a DockSlot,
+    target: &PreviewItem,
+    running_windows: &'a [RunningWindow],
+) -> Option<&'a str> {
+    let exe = running_windows
+        .iter()
+        .find(|w| w.hwnd == target.hwnd && w.pid == target.pid)
+        .map(|w| w.exe_path.trim())
+        .filter(|exe| !exe.is_empty())
+        .or_else(|| {
+            let launch = slot.launch_path.trim();
+            (apps_folder_aumid_from_spec(launch).is_none() && !launch.is_empty()).then_some(launch)
+        })?;
+    (!is_frame_host_exe(exe)).then_some(exe)
+}
+
+fn slot_real_exe_path<'a>(
+    slot: &'a DockSlot,
+    pins: &'a [PinnedApp],
+    running_windows: &'a [RunningWindow],
+) -> Option<&'a str> {
+    for item in &slot.windows {
+        if let Some(exe) = running_windows
+            .iter()
+            .find(|w| w.hwnd == item.hwnd && w.pid == item.pid)
+            .or_else(|| running_windows.iter().find(|w| w.hwnd == item.hwnd))
+            .map(|w| w.exe_path.trim())
+            .filter(|exe| !exe.is_empty() && !is_frame_host_exe(exe))
+        {
+            return Some(exe);
+        }
+    }
+    if let Some(pin) = pins.iter().find(|p| {
+        p.launch_path.eq_ignore_ascii_case(&slot.launch_path)
+            || slot.aumid.as_deref().is_some_and(|slot_id| {
+                pins::pin_normalized_aumid(p)
+                    .is_some_and(|pin_id| pin_id.eq_ignore_ascii_case(slot_id.trim()))
+            })
+    }) && let Some(exe) = pin
+        .target_exe
+        .as_deref()
+        .map(str::trim)
+        .filter(|exe| !exe.is_empty() && !is_frame_host_exe(exe))
+    {
+        return Some(exe);
+    }
+    for cand in &slot.icon_candidates {
+        let trimmed = cand.trim();
+        if apps_folder_aumid_from_spec(trimmed).is_none()
+            && !is_frame_host_exe(trimmed)
+            && Path::new(trimmed)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        {
+            return Some(trimmed);
+        }
+    }
+    let launch = slot.launch_path.trim();
+    (apps_folder_aumid_from_spec(launch).is_none()
+        && !is_frame_host_exe(launch)
+        && Path::new(launch)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe")))
+    .then_some(launch)
+}
+
+/// Launch target when files are dropped onto a dock icon: for packaged apps
+/// (`shell:AppsFolder\...`) that expose a known real non-host `exe_path`, prefer
+/// passing dropped file arguments to that executable, falling back to `launch_path`.
+fn drop_launch_target(
+    slot: &DockSlot,
+    pins: &[PinnedApp],
+    running_windows: &[RunningWindow],
+) -> String {
+    if apps_folder_aumid_from_spec(&slot.launch_path).is_some()
+        && let Some(exe) = slot_real_exe_path(slot, pins, running_windows)
+    {
+        return exe.to_owned();
+    }
+    slot.launch_path.clone()
+}
+
+fn group_member_matches_window(member_path: &str, window: &RunningWindow) -> bool {
+    let member = member_path.trim();
+    if member.is_empty() {
+        return false;
+    }
+    let w_exe = window.exe_path.trim();
+    if !w_exe.is_empty() && !is_frame_host_exe(w_exe) && w_exe.eq_ignore_ascii_case(member) {
+        return true;
+    }
+    let w_aumid = window.aumid.trim();
+    if let Some(member_aumid) = apps_folder_aumid_from_spec(member) {
+        if !w_aumid.is_empty() && w_aumid.eq_ignore_ascii_case(member_aumid) {
+            return true;
+        }
+        if !w_exe.is_empty()
+            && w_exe.to_ascii_lowercase().contains(r"\windowsapps\")
+            && pins::resolve_windowsapps_aumid(w_exe)
+                .is_some_and(|resolved| resolved.eq_ignore_ascii_case(member_aumid))
+        {
+            return true;
+        }
+    }
+    !w_aumid.is_empty()
+        && member.to_ascii_lowercase().contains(r"\windowsapps\")
+        && pins::resolve_windowsapps_aumid(member)
+            .is_some_and(|resolved| resolved.eq_ignore_ascii_case(w_aumid))
+}
+
+fn group_member_matches_slot(
+    member_path: &str,
+    slot: &DockSlot,
+    pins: &[PinnedApp],
+    running_windows: &[RunningWindow],
+) -> bool {
+    let member = member_path.trim();
+    if member.is_empty() {
+        return false;
+    }
+    if slot.launch_path.trim().eq_ignore_ascii_case(member) {
+        return true;
+    }
+    if let Some(slot_aumid) = slot
+        .aumid
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or_else(|| apps_folder_aumid_from_spec(&slot.launch_path))
+    {
+        if let Some(member_aumid) = apps_folder_aumid_from_spec(member)
+            && member_aumid.eq_ignore_ascii_case(slot_aumid)
+        {
+            return true;
+        }
+        if member.to_ascii_lowercase().contains(r"\windowsapps\")
+            && pins::resolve_windowsapps_aumid(member)
+                .is_some_and(|resolved| resolved.eq_ignore_ascii_case(slot_aumid))
+        {
+            return true;
+        }
+    }
+    if let Some(slot_exe) = slot_real_exe_path(slot, pins, running_windows)
+        && slot_exe.eq_ignore_ascii_case(member)
+    {
+        return true;
+    }
+    false
+}
+
+fn group_member_title(member_path: &str, slots: &[DockSlot]) -> String {
+    if let Some(slot) = slots.iter().find(|s| {
+        s.launch_path
+            .trim()
+            .eq_ignore_ascii_case(member_path.trim())
+    }) && !slot.label.trim().is_empty()
+    {
+        return slot.label.clone();
+    }
+    if let Some(aumid) = apps_folder_aumid_from_spec(member_path) {
+        if let Some(slot) = slots.iter().find(|s| {
+            s.aumid
+                .as_deref()
+                .is_some_and(|id| id.trim().eq_ignore_ascii_case(aumid))
+        }) && !slot.label.trim().is_empty()
+        {
+            return slot.label.clone();
+        }
+        if let Some(packaged) = pins::resolve_packaged_app(aumid) {
+            return packaged.name;
+        }
+    }
+    Path::new(member_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(member_path)
+        .to_owned()
+}
+
+fn group_aumid_lower(group_key: &str, list: &[&RunningWindow]) -> Option<String> {
+    if let Some(id) = group_key.strip_prefix("aumid:")
+        && !id.is_empty()
+    {
+        return Some(id.to_owned());
+    }
+    best_window_aumid(list).map(|id| id.to_ascii_lowercase())
+}
+
+fn group_matches_real_exe(list: &[&RunningWindow], exe_lower: &str) -> bool {
+    !exe_lower.is_empty()
+        && !is_frame_host_exe(exe_lower)
+        && list.iter().any(|w| {
+            let w_exe = w.exe_path.trim();
+            !w_exe.is_empty() && !is_frame_host_exe(w_exe) && w_exe.eq_ignore_ascii_case(exe_lower)
+        })
 }
 
 fn build_slots_for(
@@ -1413,79 +2206,176 @@ fn build_slots_for(
     settings: &DockSettings,
 ) -> Vec<DockSlot> {
     let aggregate = layout::aggregate_by_executable_path(settings);
-    let mut by_exe: HashMap<String, Vec<&RunningWindow>> = HashMap::new();
+    // Deterministic ordering preserving exact window enumeration order (never HashMap iteration).
+    let mut groups: Vec<(String, Vec<&RunningWindow>)> = Vec::new();
+    let mut group_index: HashMap<String, usize> = HashMap::new();
     for win in running {
-        by_exe
-            .entry(running_group_key(win, aggregate))
-            .or_default()
-            .push(win);
+        let key = running_group_key(win, aggregate);
+        if let Some(&idx) = group_index.get(&key) {
+            groups[idx].1.push(win);
+        } else {
+            let idx = groups.len();
+            group_index.insert(key.clone(), idx);
+            groups.push((key, vec![win]));
+        }
     }
 
-    let mut pin_matches: HashMap<String, (Vec<PreviewItem>, bool)> = HashMap::new();
-    let mut claimed_exes: HashMap<String, bool> = HashMap::new();
-    for pin in pins {
-        let exe_key = pin
-            .target_exe
-            .as_ref()
-            .map(|p| format!("exe:{}", p.to_lowercase()));
-        let aumid_key = pins::resolve_windowsapps_aumid(&pin.launch_path)
-            .map(|id| format!("aumid:{}", id.to_lowercase()));
-        let matched_key = exe_key
-            .filter(|key| by_exe.contains_key(key))
-            .or_else(|| aumid_key.filter(|key| by_exe.contains_key(key)))
+    let group_aumids: Vec<Option<String>> = groups
+        .iter()
+        .map(|(key, list)| group_aumid_lower(key, list))
+        .collect();
+
+    let pin_aumids: Vec<Option<String>> = pins
+        .iter()
+        .map(|pin| pin_effective_aumid(pin).map(|id| id.to_ascii_lowercase()))
+        .collect();
+    let pin_exes: Vec<Option<String>> = pins.iter().map(pin_real_exe_lower).collect();
+
+    // Explicitly pinned AUMIDs across ALL pins so non-host exe fallback never steals
+    // a running group that belongs to another pin's explicit AUMID (e.g. Chrome PWA).
+    let claimed_aumids: HashSet<&str> = pin_aumids.iter().filter_map(Option::as_deref).collect();
+    let mut pin_exe_counts: HashMap<&str, usize> = HashMap::new();
+    for exe in pin_exes.iter().flatten() {
+        *pin_exe_counts.entry(exe.as_str()).or_insert(0) += 1;
+    }
+
+    let mut pin_matches: Vec<Vec<&RunningWindow>> = vec![Vec::new(); pins.len()];
+    let mut claimed_group: Vec<bool> = vec![false; groups.len()];
+
+    // Priority 1: Exact normalized AUMID match across ALL pins first.
+    for (pin_idx, pin_aumid_lower) in pin_aumids.iter().enumerate() {
+        let Some(id) = pin_aumid_lower.as_deref() else {
+            continue;
+        };
+        let exact = format!("aumid:{id}");
+        let matched_idx = group_index
+            .get(&exact)
+            .copied()
+            .filter(|&idx| !claimed_group[idx])
             .or_else(|| {
-                let stem = pin.name.to_lowercase();
-                by_exe
-                    .keys()
-                    .filter_map(|key| key.strip_prefix("exe:"))
-                    .find(|path| {
-                        Path::new(path)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .is_some_and(|s| s.eq_ignore_ascii_case(&stem))
-                    })
-                    .map(|path| format!("exe:{path}"))
+                groups.iter().enumerate().find_map(|(idx, (_, list))| {
+                    (!claimed_group[idx]
+                        && list.iter().any(|w| w.aumid.trim().eq_ignore_ascii_case(id)))
+                    .then_some(idx)
+                })
             });
-        let (windows, is_fg) = match matched_key {
-            Some(ref key) => {
-                claimed_exes.insert(key.clone(), true);
-                let list = &by_exe[key];
-                (
-                    list.iter()
+        if let Some(idx) = matched_idx {
+            claimed_group[idx] = true;
+            pin_matches[pin_idx].extend(groups[idx].1.iter().copied());
+        }
+    }
+
+    // Priority 2: Non-host real executable match for unmatched pins.
+    // Process pins without an explicit AUMID first (e.g. bare Chrome pin before a PWA pin
+    // sharing chrome.exe), merging all unclaimed groups for that non-host exe whose AUMID
+    // is not explicitly claimed by another pin.
+    let mut exe_pass_order: Vec<usize> = (0..pins.len())
+        .filter(|&i| pin_matches[i].is_empty() && pin_exes[i].is_some())
+        .collect();
+    exe_pass_order.sort_by_key(|&i| pin_aumids[i].is_some());
+    for pin_idx in exe_pass_order {
+        let Some(exe) = pin_exes[pin_idx].as_deref() else {
+            continue;
+        };
+        let own_aumid = pin_aumids[pin_idx].as_deref();
+        for (idx, (_, list)) in groups.iter().enumerate() {
+            if claimed_group[idx] || !group_matches_real_exe(list, exe) {
+                continue;
+            }
+            let aumid_claimed_elsewhere = group_aumids[idx]
+                .as_deref()
+                .is_some_and(|gid| claimed_aumids.contains(gid) && own_aumid != Some(gid));
+            if aumid_claimed_elsewhere {
+                continue;
+            }
+            claimed_group[idx] = true;
+            pin_matches[pin_idx].extend(list.iter().copied());
+        }
+    }
+
+    // Priority 2b: If a pin matched in Priority 1 and is the sole pin for its non-host exe,
+    // also coalesce any remaining unclaimed no-AUMID groups for that same non-host exe
+    // (e.g. Chrome windows without AUMID alongside Chrome windows with AUMID).
+    for pin_idx in 0..pins.len() {
+        if pin_matches[pin_idx].is_empty() {
+            continue;
+        }
+        let Some(exe) = pin_exes[pin_idx].as_deref() else {
+            continue;
+        };
+        if pin_exe_counts.get(exe).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        for (idx, (_, list)) in groups.iter().enumerate() {
+            if claimed_group[idx]
+                || group_aumids[idx].is_some()
+                || !group_matches_real_exe(list, exe)
+            {
+                continue;
+            }
+            claimed_group[idx] = true;
+            pin_matches[pin_idx].extend(list.iter().copied());
+        }
+    }
+
+    // Priority 3: Fallback filename stem match only for classic non-AUMID pins & non-frame-host exes.
+    for (pin_idx, pin) in pins.iter().enumerate() {
+        if !pin_matches[pin_idx].is_empty() || pin_aumids[pin_idx].is_some() {
+            continue;
+        }
+        let stem = pin.name.to_lowercase();
+        let matched_idx = groups.iter().enumerate().find_map(|(idx, (key, _))| {
+            if claimed_group[idx] {
+                return None;
+            }
+            let path = key.strip_prefix("exe:")?;
+            (!path.is_empty()
+                && !is_frame_host_exe(path)
+                && Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&stem)))
+            .then_some(idx)
+        });
+        if let Some(idx) = matched_idx {
+            claimed_group[idx] = true;
+            pin_matches[pin_idx].extend(groups[idx].1.iter().copied());
+        }
+    }
+
+    let mut next: Vec<DockSlot> = Vec::with_capacity(pins.len() + groups.len());
+    let mut emitted_keys: HashSet<String> = HashSet::new();
+
+    for old in prev {
+        if old.pinned {
+            if let Some((pin_idx, pin)) = pins
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.launch_path.eq_ignore_ascii_case(&old.key))
+            {
+                let key = pin.launch_path.to_lowercase();
+                let list = pin_matches[pin_idx].as_slice();
+                let (aumid, icon_source, icon_candidates, rep_hwnd) =
+                    pinned_slot_identity(pin, list);
+                emitted_keys.insert(key.clone());
+                next.push(DockSlot {
+                    key,
+                    pinned: true,
+                    label: pin.name.clone(),
+                    launch_path: pin.launch_path.clone(),
+                    aumid,
+                    icon_source,
+                    icon_candidates,
+                    rep_hwnd,
+                    windows: list
+                        .iter()
                         .map(|w| PreviewItem {
                             hwnd: w.hwnd,
                             pid: w.pid,
                             title: w.title.clone(),
                         })
                         .collect(),
-                    list.iter().any(|w| w.is_foreground),
-                )
-            }
-            None => (Vec::new(), false),
-        };
-        pin_matches.insert(pin.launch_path.to_lowercase(), (windows, is_fg));
-    }
-
-    let mut next: Vec<DockSlot> = Vec::with_capacity(pins.len() + by_exe.len());
-    let mut emitted_keys: HashMap<String, bool> = HashMap::new();
-
-    for old in prev {
-        if old.pinned {
-            if let Some(pin) = pins
-                .iter()
-                .find(|p| p.launch_path.eq_ignore_ascii_case(&old.key))
-            {
-                let key = pin.launch_path.to_lowercase();
-                let (windows, is_foreground) = pin_matches.get(&key).cloned().unwrap_or_default();
-                emitted_keys.insert(key.clone(), true);
-                next.push(DockSlot {
-                    key,
-                    pinned: true,
-                    label: pin.name.clone(),
-                    launch_path: pin.launch_path.clone(),
-                    icon_source: pin.icon_source.clone(),
-                    windows,
-                    is_foreground,
+                    is_foreground: list.iter().any(|w| w.is_foreground),
                     scale: old.scale,
                     scale_velocity: old.scale_velocity,
                     slide_x: old.slide_x,
@@ -1494,50 +2384,114 @@ fn build_slots_for(
                     badge: old.badge,
                 });
             }
-        } else if !claimed_exes.contains_key(&old.key)
-            && let Some(list) = by_exe.get(&old.key)
-        {
-            emitted_keys.insert(old.key.clone(), true);
-            next.push(DockSlot {
-                key: old.key.clone(),
-                pinned: false,
-                label: old.label.clone(),
-                launch_path: old.launch_path.clone(),
-                icon_source: old.icon_source.clone(),
-                windows: list
-                    .iter()
-                    .map(|w| PreviewItem {
-                        hwnd: w.hwnd,
-                        pid: w.pid,
-                        title: w.title.clone(),
+        } else {
+            // Match an existing unpinned slot by its group key first; if its identity upgraded
+            // (e.g. an unattached ApplicationFrameHost window gained a real AUMID), match by
+            // shared live HWND so the slot keeps its dock position and upgrades its icon in place.
+            let matched_group_idx = group_index
+                .get(&old.key)
+                .copied()
+                .filter(|&idx| !claimed_group[idx] && !emitted_keys.contains(&groups[idx].0))
+                .or_else(|| {
+                    groups.iter().enumerate().find_map(|(idx, (key, list))| {
+                        (!claimed_group[idx]
+                            && !emitted_keys.contains(key)
+                            && list
+                                .iter()
+                                .any(|w| old.windows.iter().any(|prev_w| prev_w.hwnd == w.hwnd)))
+                        .then_some(idx)
                     })
-                    .collect(),
-                is_foreground: list.iter().any(|w| w.is_foreground),
-                scale: old.scale,
-                scale_velocity: old.scale_velocity,
-                slide_x: old.slide_x,
-                bounce_started: old.bounce_started,
-                close_started: None,
-                badge: old.badge,
-            });
+                });
+            if let Some(group_idx) = matched_group_idx {
+                let (group_key, list) = &groups[group_idx];
+                emitted_keys.insert(group_key.clone());
+                let (new_aumid, new_label, new_launch, new_icon_source, new_candidates, rep_hwnd) =
+                    running_slot_identity(list);
+                let identity_upgraded = group_key != &old.key
+                    || (old.aumid.is_none() && new_aumid.is_some())
+                    || (is_frame_host_exe(&old.icon_source)
+                        && !is_frame_host_exe(&new_icon_source))
+                    || (old.icon_candidates != new_candidates && !new_candidates.is_empty());
+                let label = if identity_upgraded
+                    || old.label.is_empty()
+                    || old.label.eq_ignore_ascii_case("applicationframehost")
+                {
+                    new_label
+                } else {
+                    old.label.clone()
+                };
+                let launch_path = if identity_upgraded
+                    || old.launch_path.is_empty()
+                    || is_frame_host_exe(&old.launch_path)
+                    || apps_folder_aumid_from_spec(&new_launch).is_some()
+                {
+                    new_launch
+                } else {
+                    old.launch_path.clone()
+                };
+                let (icon_source, icon_candidates) = if !new_candidates.is_empty()
+                    || is_frame_host_exe(&old.icon_source)
+                    || old.icon_source.is_empty()
+                {
+                    (new_icon_source, new_candidates)
+                } else {
+                    (old.icon_source.clone(), old.icon_candidates.clone())
+                };
+                next.push(DockSlot {
+                    key: group_key.clone(),
+                    pinned: false,
+                    label,
+                    launch_path,
+                    aumid: new_aumid.or_else(|| old.aumid.clone()),
+                    icon_source,
+                    icon_candidates,
+                    rep_hwnd,
+                    windows: list
+                        .iter()
+                        .map(|w| PreviewItem {
+                            hwnd: w.hwnd,
+                            pid: w.pid,
+                            title: w.title.clone(),
+                        })
+                        .collect(),
+                    is_foreground: list.iter().any(|w| w.is_foreground),
+                    scale: old.scale,
+                    scale_velocity: old.scale_velocity,
+                    slide_x: old.slide_x,
+                    bounce_started: old.bounce_started,
+                    close_started: None,
+                    badge: old.badge,
+                });
+            }
         }
     }
 
-    for pin in pins {
+    for (pin_idx, pin) in pins.iter().enumerate() {
         let key = pin.launch_path.to_lowercase();
-        if emitted_keys.contains_key(&key) {
+        if emitted_keys.contains(&key) {
             continue;
         }
-        let (windows, is_foreground) = pin_matches.get(&key).cloned().unwrap_or_default();
-        emitted_keys.insert(key.clone(), true);
+        let list = pin_matches[pin_idx].as_slice();
+        let (aumid, icon_source, icon_candidates, rep_hwnd) = pinned_slot_identity(pin, list);
+        emitted_keys.insert(key.clone());
         next.push(DockSlot {
             key,
             pinned: true,
             label: pin.name.clone(),
             launch_path: pin.launch_path.clone(),
-            icon_source: pin.icon_source.clone(),
-            windows,
-            is_foreground,
+            aumid,
+            icon_source,
+            icon_candidates,
+            rep_hwnd,
+            windows: list
+                .iter()
+                .map(|w| PreviewItem {
+                    hwnd: w.hwnd,
+                    pid: w.pid,
+                    title: w.title.clone(),
+                })
+                .collect(),
+            is_foreground: list.iter().any(|w| w.is_foreground),
             scale: 1.0,
             scale_velocity: 0.0,
             slide_x: 0.0,
@@ -1547,23 +2501,22 @@ fn build_slots_for(
         });
     }
 
-    for win in running {
-        let key = running_group_key(win, aggregate);
-        if claimed_exes.contains_key(&key) || emitted_keys.contains_key(&key) {
+    for (idx, (key, list)) in groups.iter().enumerate() {
+        if claimed_group[idx] || emitted_keys.contains(key) {
             continue;
         }
-        emitted_keys.insert(key.clone(), true);
-        let list = &by_exe[&key];
-        let label = exe_display_name(&win.exe_path, &win.title);
-        let icon_source = pins::resolve_windowsapps_aumid(&win.exe_path)
-            .map(|id| format!(r"shell:AppsFolder\{id}"))
-            .unwrap_or_else(|| win.exe_path.clone());
+        emitted_keys.insert(key.clone());
+        let (aumid, label, launch_path, icon_source, icon_candidates, rep_hwnd) =
+            running_slot_identity(list);
         next.push(DockSlot {
-            key,
+            key: key.clone(),
             pinned: false,
             label,
-            launch_path: win.exe_path.clone(),
+            launch_path,
+            aumid,
             icon_source,
+            icon_candidates,
+            rep_hwnd,
             windows: list
                 .iter()
                 .map(|w| PreviewItem {
@@ -2206,6 +3159,8 @@ impl DockState {
             bin_is_full,
             widget_visuals: Vec::new(),
             stack_visuals: Vec::new(),
+            folder_snapshots: FolderSnapshotCache::default(),
+            pending_folder_snapshots: Arc::new(Mutex::new(Vec::new())),
             folder_fallback_surf,
             hovered_stack: None,
             pressed_stack: None,
@@ -2223,6 +3178,8 @@ impl DockState {
             dot_running,
             dot_active,
             icon_surfaces: HashMap::new(),
+            next_icon_surface_gen: 1,
+            icon_retries: HashMap::new(),
             fallback_surfaces: HashMap::new(),
             in_flight_icons: HashSet::new(),
             pending_icons: Arc::new(Mutex::new(Vec::new())),
@@ -2456,6 +3413,7 @@ impl DockState {
                     badge_count: 0,
                     bound_source: String::new(),
                     bound_has_icon: false,
+                    bound_surface_gen: 0,
                     bound_dot_state: 0,
                     fading: false,
                 });
@@ -2502,6 +3460,7 @@ impl DockState {
                 icon,
                 source: String::new(),
                 has_icon: false,
+                bound_surface_gen: 0,
                 label: String::new(),
             });
         }
@@ -2565,9 +3524,9 @@ impl DockState {
                 icon,
                 bound_source: String::new(),
                 bound_has_icon: false,
+                bound_surface_gen: 0,
                 scale: 1.0,
                 scale_velocity: 0.0,
-                cached_count: None,
             });
         }
         let count = self.stack_visuals.len();
@@ -3413,6 +4372,7 @@ impl DockState {
         for sv in &mut self.stack_visuals {
             sv.bound_source.clear();
             sv.bound_has_icon = false;
+            sv.bound_surface_gen = 0;
         }
         self.rebuild_visual_tree();
     }
@@ -3579,53 +4539,198 @@ impl DockState {
         self.update_visuals();
     }
 
+    fn insert_loaded_icon_surface(
+        &mut self,
+        key: String,
+        surface: IDCompositionSurface,
+        upgrade_prefix_len: usize,
+    ) {
+        if upgrade_prefix_len == 0 {
+            self.icon_retries.remove(&key);
+        }
+        let generation = self.next_icon_surface_gen;
+        self.next_icon_surface_gen = self.next_icon_surface_gen.wrapping_add(1).max(1);
+        self.icon_surfaces.insert(
+            key,
+            LoadedIconSurface {
+                surface,
+                generation,
+                upgrade_prefix_len,
+            },
+        );
+    }
+
     fn request_missing_icons(&mut self) {
-        let mut missing = Vec::new();
-        let sources = self
-            .slots
+        let now = Instant::now();
+        let mut requested: Vec<(String, Vec<String>, Option<isize>)> = Vec::with_capacity(
+            self.slots.len() + self.tray_pin_visuals.len() + self.stack_visuals.len(),
+        );
+        for slot in &self.slots {
+            let Some(key) = slot_icon_key(slot) else {
+                continue;
+            };
+            let candidates = if !slot.icon_candidates.is_empty() {
+                slot.icon_candidates.clone()
+            } else if !slot.icon_source.trim().is_empty() && !is_frame_host_exe(&slot.icon_source) {
+                vec![slot.icon_source.clone()]
+            } else {
+                Vec::new()
+            };
+            requested.push((key.into_owned(), candidates, slot.rep_hwnd));
+        }
+        for path in self
+            .settings
+            .user_pinned_background_apps
             .iter()
-            .map(|slot| &slot.icon_source)
-            .chain(
-                self.settings
-                    .user_pinned_background_apps
-                    .iter()
-                    .take(self.tray_pin_visuals.len()),
-            )
-            .chain(self.stack_visuals.iter().map(|sv| &sv.path));
-        for source in sources {
-            if !self.icon_surfaces.contains_key(source) {
-                if let Some(raw) = icon_cache::read_cached_raw(source)
-                    && let Ok(surf) = self.dcomp.create_app_icon_surface(&raw)
-                {
-                    self.icon_surfaces.insert(source.clone(), Some(surf));
+            .take(self.tray_pin_visuals.len())
+        {
+            if !path.is_empty() {
+                requested.push((path.clone(), vec![path.clone()], None));
+            }
+        }
+        for sv in &self.stack_visuals {
+            if !sv.path.is_empty() {
+                requested.push((sv.path.clone(), vec![sv.path.clone()], None));
+            }
+        }
+
+        let mut missing: Vec<IconLoadRequest> = Vec::new();
+        for (key, candidates, rep_hwnd) in requested {
+            if let Some(loaded) = self.icon_surfaces.get(&key) {
+                let prefix_len = loaded.upgrade_prefix_len.min(candidates.len());
+                if prefix_len == 0 {
                     continue;
                 }
-                if self.in_flight_icons.insert(source.clone()) {
-                    missing.push(source.clone());
+                let upgrade_candidates = candidates[..prefix_len].to_vec();
+                match probe_cached_icon_candidates(&upgrade_candidates, |cand| {
+                    icon_cache::read_cached_raw(cand)
+                        .and_then(|raw| self.dcomp.create_app_icon_surface(&raw).ok())
+                }) {
+                    IconCacheProbe::PrimaryHit(surf) => {
+                        self.insert_loaded_icon_surface(key, surf, 0);
+                        continue;
+                    }
+                    IconCacheProbe::FallbackHit {
+                        surface,
+                        upgrade_prefix_len,
+                    } => {
+                        self.insert_loaded_icon_surface(key.clone(), surface, upgrade_prefix_len);
+                        let higher = upgrade_candidates[..upgrade_prefix_len].to_vec();
+                        if IconRetryState::should_attempt(self.icon_retries.get(&key), &higher, now)
+                            && self.in_flight_icons.insert(key.clone())
+                        {
+                            missing.push(IconLoadRequest {
+                                key,
+                                candidates: higher,
+                                rep_hwnd: None,
+                            });
+                        }
+                        continue;
+                    }
+                    IconCacheProbe::Miss => {
+                        if IconRetryState::should_attempt(
+                            self.icon_retries.get(&key),
+                            &upgrade_candidates,
+                            now,
+                        ) && self.in_flight_icons.insert(key.clone())
+                        {
+                            missing.push(IconLoadRequest {
+                                key,
+                                candidates: upgrade_candidates,
+                                rep_hwnd: None,
+                            });
+                        }
+                        continue;
+                    }
                 }
+            }
+            // Fast synchronous hit from memory/disk cache before spawning a worker.
+            match probe_cached_icon_candidates(&candidates, |cand| {
+                icon_cache::read_cached_raw(cand)
+                    .and_then(|raw| self.dcomp.create_app_icon_surface(&raw).ok())
+            }) {
+                IconCacheProbe::PrimaryHit(surf) => {
+                    self.insert_loaded_icon_surface(key, surf, 0);
+                    continue;
+                }
+                IconCacheProbe::FallbackHit {
+                    surface,
+                    upgrade_prefix_len,
+                } => {
+                    self.insert_loaded_icon_surface(key.clone(), surface, upgrade_prefix_len);
+                    let upgrade_candidates = candidates[..upgrade_prefix_len].to_vec();
+                    if IconRetryState::should_attempt(
+                        self.icon_retries.get(&key),
+                        &upgrade_candidates,
+                        now,
+                    ) && self.in_flight_icons.insert(key.clone())
+                    {
+                        missing.push(IconLoadRequest {
+                            key,
+                            candidates: upgrade_candidates,
+                            rep_hwnd: None,
+                        });
+                    }
+                    continue;
+                }
+                IconCacheProbe::Miss => {}
+            }
+            if !IconRetryState::should_attempt(self.icon_retries.get(&key), &candidates, now) {
+                continue;
+            }
+            if self.in_flight_icons.insert(key.clone()) {
+                missing.push(IconLoadRequest {
+                    key,
+                    candidates,
+                    rep_hwnd,
+                });
             }
         }
         if missing.is_empty() {
             return;
         }
+        let rollback_keys: Vec<String> = missing.iter().map(|req| req.key.clone()).collect();
         let pending = self.pending_icons.clone();
         let hwnd_val = self.hwnd;
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("dock-icons".to_owned())
             .spawn(move || {
-                let batch = icon_cache::resolve_batch_raw(&missing);
+                let mut results = Vec::with_capacity(missing.len());
+                for req in missing {
+                    let resolved =
+                        icon_cache::resolve_first_valid(&req.candidates, icon_cache::ICON_PX)
+                            .or_else(|| {
+                                req.rep_hwnd.filter(|&hwnd| hwnd != 0).and_then(|hwnd| {
+                                    icon_cache::extract_hwnd_icon_bgra(hwnd, icon_cache::ICON_PX)
+                                })
+                            })
+                            .map(|(width, height, pixels)| RawIcon {
+                                width,
+                                height,
+                                pixels: Arc::from(pixels),
+                            });
+                    results.push(IconLoadResult {
+                        key: req.key,
+                        signature: req.candidates,
+                        icon: resolved,
+                    });
+                }
                 if let Ok(mut queue) = pending.lock() {
-                    queue.push(batch);
+                    queue.push(results);
                 }
                 unsafe {
                     let _ = PostMessageW(hwnd_val as HWND, WM_APP_ICONS, 0, 0);
                 }
-            })
-            .ok();
+            });
+        if spawned.is_err() {
+            for key in rollback_keys {
+                self.in_flight_icons.remove(&key);
+            }
+        }
     }
 
     fn drain_loaded_icons(&mut self) {
-        let batches: Vec<HashMap<String, Option<RawIcon>>> = {
+        let batches: Vec<Vec<IconLoadResult>> = {
             let Ok(mut queue) = self.pending_icons.lock() else {
                 return;
             };
@@ -3634,14 +4739,92 @@ impl DockState {
         if batches.is_empty() {
             return;
         }
+        let now = Instant::now();
         for batch in batches {
-            for (spec, raw_opt) in batch {
-                self.in_flight_icons.remove(&spec);
-                let surf = raw_opt.and_then(|raw| self.dcomp.create_app_icon_surface(&raw).ok());
-                self.icon_surfaces.insert(spec, surf);
+            for item in batch {
+                self.in_flight_icons.remove(&item.key);
+                if let Some(raw) = item.icon
+                    && let Ok(surface) = self.dcomp.create_app_icon_surface(&raw)
+                {
+                    self.insert_loaded_icon_surface(item.key, surface, 0);
+                } else {
+                    let next = IconRetryState::record_failure(
+                        self.icon_retries.get(&item.key),
+                        item.signature,
+                        now,
+                    );
+                    self.icon_retries.insert(item.key, next);
+                }
             }
         }
         self.update_visuals();
+    }
+
+    fn refresh_folder_snapshot_async(&mut self, path: &str) {
+        if path.trim().is_empty() {
+            return;
+        }
+        let Some(scan_gen) = self.folder_snapshots.mark_in_flight(path) else {
+            return;
+        };
+        let folder_path = path.to_owned();
+        let key = canonical_folder_key(&folder_path);
+        let pending = self.pending_folder_snapshots.clone();
+        let hwnd_val = self.hwnd;
+        let spawned = std::thread::Builder::new()
+            .name("dock-folder-snap".to_owned())
+            .spawn(move || {
+                let result = match read_stack_entries(&folder_path) {
+                    Some(raw) => {
+                        let total_count = raw.len();
+                        let entries =
+                            layout::order_stack_entries(raw, layout::STACK_FLYOUT_MAX_ITEMS);
+                        FolderSnapshotResult {
+                            key,
+                            generation: scan_gen,
+                            entries: Some(entries),
+                            total_count,
+                            refreshed_at: Instant::now(),
+                        }
+                    }
+                    None => FolderSnapshotResult {
+                        key,
+                        generation: scan_gen,
+                        entries: None,
+                        total_count: 0,
+                        refreshed_at: Instant::now(),
+                    },
+                };
+                if let Ok(mut queue) = pending.lock() {
+                    queue.push(result);
+                }
+                unsafe {
+                    let _ = PostMessageW(hwnd_val as HWND, WM_APP_FOLDER_SNAPSHOT, 0, 0);
+                }
+            });
+        if spawned.is_err() {
+            self.folder_snapshots.clear_in_flight(path, scan_gen);
+        }
+    }
+
+    fn drain_folder_snapshots(&mut self) {
+        let updates: Vec<FolderSnapshotResult> = {
+            let Ok(mut queue) = self.pending_folder_snapshots.lock() else {
+                return;
+            };
+            std::mem::take(&mut *queue)
+        };
+        if updates.is_empty() {
+            return;
+        }
+        let mut any_applied = false;
+        for update in updates {
+            any_applied |= self.folder_snapshots.complete(update);
+        }
+        if any_applied && self.hovered_stack.is_some() {
+            self.tooltip_cache = None;
+            self.update_visuals();
+        }
     }
 
     fn sync_slots(&mut self, animate_closes: bool) -> bool {
@@ -3712,7 +4895,32 @@ impl DockState {
                     || a.is_foreground != b.is_foreground
                     || a.windows.len() != b.windows.len()
                     || a.close_started != b.close_started
+                    || a.icon_source != b.icon_source
+                    || a.icon_candidates != b.icon_candidates
+                    || a.aumid != b.aumid
+                    || a.rep_hwnd != b.rep_hwnd
             });
+        // Reset icon retry backoff immediately whenever a slot's identity or candidates improved.
+        for slot in &next {
+            if let Some(icon_key) = slot_icon_key(slot) {
+                let should_clear = self
+                    .icon_retries
+                    .get(icon_key.as_ref())
+                    .is_some_and(|retry| {
+                        let expected_sig = match self.icon_surfaces.get(icon_key.as_ref()) {
+                            Some(loaded) if loaded.upgrade_prefix_len > 0 => {
+                                &slot.icon_candidates
+                                    [..loaded.upgrade_prefix_len.min(slot.icon_candidates.len())]
+                            }
+                            _ => slot.icon_candidates.as_slice(),
+                        };
+                        retry.signature != expected_sig
+                    });
+                if should_clear {
+                    self.icon_retries.remove(icon_key.as_ref());
+                }
+            }
+        }
         self.slots = next;
         if len_changed {
             self.rebuild_visual_tree();
@@ -3733,14 +4941,23 @@ impl DockState {
         changed
     }
 
-    /// Drops DComp surfaces for icons that are no longer pinned. Without this, the cache grows
-    /// with every icon source ever seen (each surface is 64×64 BGRA ≈ 16 KiB of VRAM).
-    /// `None` entries are kept: they record a failed extraction and avoid re-spawning the worker.
+    /// Drops DComp surfaces and retry records for icons that are no longer active.
+    /// Without this, the cache grows with every icon source ever seen (each surface is
+    /// 64×64 BGRA ≈ 16 KiB of VRAM).
     fn prune_icon_surfaces(&mut self) {
-        let keep: HashSet<&str> = self
+        let slot_icon_keys: Vec<String> = self
             .slots
             .iter()
-            .map(|slot| slot.icon_source.as_str())
+            .filter_map(|slot| slot_icon_key(slot).map(Cow::into_owned))
+            .collect();
+        let hover_keys: Vec<String> = slot_icon_keys
+            .iter()
+            .map(|key| icon_cache::hover_variant_key(key, true))
+            .collect();
+        let keep: HashSet<&str> = slot_icon_keys
+            .iter()
+            .map(String::as_str)
+            .chain(hover_keys.iter().map(String::as_str))
             .chain(
                 self.settings
                     .user_pinned_background_apps
@@ -3751,7 +4968,9 @@ impl DockState {
             .chain(self.in_flight_icons.iter().map(String::as_str))
             .collect();
         self.icon_surfaces
-            .retain(|source, surface| surface.is_none() || keep.contains(source.as_str()));
+            .retain(|source, _| keep.contains(source.as_str()));
+        self.icon_retries
+            .retain(|source, _| keep.contains(source.as_str()));
     }
 
     fn sync_window_bounds(&mut self) {
@@ -5111,18 +6330,25 @@ impl DockState {
         let count = self.tray_pin_visuals.len();
         for index in 0..count {
             let path = &self.settings.user_pinned_background_apps[index];
-            let has_icon = self.icon_surfaces.get(path).is_some_and(Option::is_some);
+            let loaded = self.icon_surfaces.get(path);
+            let has_icon = loaded.is_some();
+            let surface_gen = loaded.map_or(0, |entry| entry.generation);
             if self.tray_pin_visuals[index].source != *path
                 || self.tray_pin_visuals[index].has_icon != has_icon
+                || self.tray_pin_visuals[index].bound_surface_gen != surface_gen
             {
                 let path = path.clone();
-                let surface = self.icon_surfaces.get(&path).and_then(Clone::clone);
+                let surface = self
+                    .icon_surfaces
+                    .get(&path)
+                    .map(|entry| entry.surface.clone());
                 let label = tray::friendly_name(&path);
                 let surface = surface.or_else(|| self.fallback_surface_for(&label));
                 let visual = &mut self.tray_pin_visuals[index];
                 visual.icon.set_content(surface.as_ref());
                 visual.source = path;
                 visual.has_icon = has_icon;
+                visual.bound_surface_gen = surface_gen;
                 visual.label = label;
             }
             let path = &self.settings.user_pinned_background_apps[index];
@@ -5171,21 +6397,25 @@ impl DockState {
         for (index, &(left, _, right, _)) in rects.iter().enumerate().take(self.stack_visuals.len())
         {
             let path = self.stack_visuals[index].path.clone();
-            let has_icon = self.icon_surfaces.get(&path).is_some_and(Option::is_some);
+            let loaded = self.icon_surfaces.get(&path);
+            let has_icon = loaded.is_some();
+            let surface_gen = loaded.map_or(0, |entry| entry.generation);
             if self.stack_visuals[index].bound_source != path
                 || self.stack_visuals[index].bound_has_icon != has_icon
+                || self.stack_visuals[index].bound_surface_gen != surface_gen
             {
                 let label = self.stack_visuals[index].label.clone();
                 let surface = self
                     .icon_surfaces
                     .get(&path)
-                    .and_then(Clone::clone)
+                    .map(|entry| entry.surface.clone())
                     .or_else(|| self.folder_fallback_surf.clone())
                     .or_else(|| self.fallback_surface_for(&label));
                 let visual = &mut self.stack_visuals[index];
                 visual.icon.set_content(surface.as_ref());
                 visual.bound_source = path;
                 visual.bound_has_icon = has_icon;
+                visual.bound_surface_gen = surface_gen;
             }
             let pressed = self.pressed_stack == Some(index);
             let hovered = self.hovered_stack == Some(index);
@@ -5217,20 +6447,21 @@ impl DockState {
         }
     }
 
-    /// `"{label} ({count})"` tooltip for a folder stack; the item count is re-read
-    /// at most every `STACK_COUNT_TTL` (hidden/system/temp entries excluded).
+    /// `"{label} ({count})"` tooltip for a folder stack. Reads ONLY from the
+    /// in-memory `FolderSnapshotCache` and triggers an async background scan if
+    /// stale or missing (zero synchronous `read_dir` on hover).
     fn stack_tooltip_text(&mut self, index: usize) -> Option<String> {
         let now = Instant::now();
-        let visual = self.stack_visuals.get(index)?;
-        let count = if layout::stack_count_fresh(visual.cached_count, now) {
-            visual.cached_count.map(|(_, count)| count)
-        } else {
-            let fresh = stack_item_count(&visual.path);
-            let visual = self.stack_visuals.get_mut(index)?;
-            visual.cached_count = fresh.map(|count| (now, count));
-            fresh
+        let (path, label) = {
+            let visual = self.stack_visuals.get(index)?;
+            (visual.path.clone(), visual.label.clone())
         };
-        let label = self.stack_visuals.get(index)?.label.clone();
+        let cached = self.folder_snapshots.get(&path);
+        let count = cached.and_then(|snap| snap.total_count);
+        let stale_or_missing = cached.is_none_or(|snap| !snap.is_fresh(now));
+        if stale_or_missing {
+            self.refresh_folder_snapshot_async(&path);
+        }
         Some(layout::stack_tooltip(&label, count))
     }
 
@@ -5421,23 +6652,21 @@ impl DockState {
             let slide_x = self.slots[idx].slide_x;
             // `ApplicationIconProvider.UseHoverIcon`: only swap when a hover
             // variant actually exists and the icon is magnified by the pointer.
-            let hover_key = icon_cache::hover_variant_key(&self.slots[idx].icon_source, true);
-            let has_hover_variant = self
-                .icon_surfaces
-                .get(&hover_key)
-                .is_some_and(|surface| surface.is_some());
-            let hover_source = if use_hover_icon(
+            let base_source = slot_icon_key(&self.slots[idx])
+                .map(Cow::into_owned)
+                .unwrap_or_default();
+            let hover_key = icon_cache::hover_variant_key(&base_source, true);
+            let has_hover_variant = self.icon_surfaces.contains_key(&hover_key);
+            let source_key = if use_hover_icon(
                 self.hovered_idx == Some(idx),
                 self.slots[idx].scale > 1.05,
                 has_hover_variant,
             ) {
-                Some(hover_key)
+                hover_key
             } else {
-                None
+                base_source
             };
-            let source_ref = hover_source
-                .as_deref()
-                .unwrap_or(self.slots[idx].icon_source.as_str());
+            let source_ref = source_key.as_str();
             let running = !self.slots[idx].windows.is_empty();
             let active = self.slots[idx].is_foreground;
             let close = close_progress(self.slots[idx].close_started, now);
@@ -5451,24 +6680,24 @@ impl DockState {
                 self.slot_visuals[idx].fading = exiting;
             }
 
-            let has_real_icon = self
-                .icon_surfaces
-                .get(source_ref)
-                .and_then(|o| o.as_ref())
-                .is_some();
+            let loaded_icon = self.icon_surfaces.get(source_ref);
+            let has_real_icon = loaded_icon.is_some();
+            let surface_gen = loaded_icon.map_or(0, |entry| entry.generation);
             if self.slot_visuals[idx].bound_source != source_ref
                 || self.slot_visuals[idx].bound_has_icon != has_real_icon
+                || self.slot_visuals[idx].bound_surface_gen != surface_gen
             {
                 let source = source_ref.to_owned();
                 let label = self.slots[idx].label.clone();
                 let surf = self
                     .icon_surfaces
                     .get(&source)
-                    .and_then(|o| o.clone())
+                    .map(|entry| entry.surface.clone())
                     .or_else(|| self.fallback_surface_for(&label));
                 self.slot_visuals[idx].icon.set_content(surf.as_ref());
                 self.slot_visuals[idx].bound_source = source;
                 self.slot_visuals[idx].bound_has_icon = has_real_icon;
+                self.slot_visuals[idx].bound_surface_gen = surface_gen;
             }
 
             if dragging_this {
@@ -5717,16 +6946,24 @@ impl DockState {
         if let Some(drag) = active_drag
             && let Some(slot) = self.slots.get(drag.idx)
         {
-            let source = slot.icon_source.clone();
+            let source = slot_icon_key(slot).map(Cow::into_owned).unwrap_or_default();
             let label = slot.label.clone();
-            if self.drag_ghost_source.as_deref() != Some(source.as_str()) {
+            let surface_gen = self
+                .icon_surfaces
+                .get(&source)
+                .map_or(0, |entry| entry.generation);
+            if self
+                .drag_ghost_source
+                .as_ref()
+                .is_none_or(|(bound, bound_gen)| bound != &source || *bound_gen != surface_gen)
+            {
                 let surf = self
                     .icon_surfaces
                     .get(&source)
-                    .and_then(|o| o.clone())
+                    .map(|entry| entry.surface.clone())
                     .or_else(|| self.fallback_surface_for(&label));
                 self.drag_ghost.set_content(surf.as_ref());
-                self.drag_ghost_source = Some(source);
+                self.drag_ghost_source = Some((source, surface_gen));
             }
             let ghost_dim = base * 1.14;
             let gx = (drag.current_x - drag.grab_offset_x - ghost_dim * 0.5)
@@ -6170,7 +7407,7 @@ impl DockState {
             let live: Vec<PreviewItem> = self
                 .running_windows
                 .iter()
-                .filter(|window| window.exe_path.eq_ignore_ascii_case(path))
+                .filter(|window| group_member_matches_window(path, window))
                 .map(|window| PreviewItem {
                     hwnd: window.hwnd,
                     pid: window.pid,
@@ -6180,11 +7417,7 @@ impl DockState {
             live_total += live.len();
             blocks.push(FlyoutBlock::ActionRow {
                 id: GROUP_FLYOUT_ROW_ID_BASE + offset as u32,
-                title: Path::new(path)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or(path)
-                    .to_owned(),
+                title: group_member_title(path, &self.slots),
                 subtitle: Some(format!("{} · {}", live.len(), loc::t("WidgetInstalled"))),
                 badge: None,
                 icon: None,
@@ -6223,10 +7456,23 @@ impl DockState {
         self.hover_flyout_open = false;
         match action {
             Some(1) => {
+                let matching_slot = self
+                    .slots
+                    .iter()
+                    .find(|s| s.launch_path.eq_ignore_ascii_case(slot_path))
+                    .cloned();
                 if let Some(member) = self.settings.app_groups.get_mut(group_index) {
-                    member
-                        .executable_paths
-                        .retain(|path| !path.eq_ignore_ascii_case(slot_path));
+                    member.executable_paths.retain(|path| {
+                        !path.eq_ignore_ascii_case(slot_path)
+                            && matching_slot.as_ref().is_none_or(|slot| {
+                                !group_member_matches_slot(
+                                    path,
+                                    slot,
+                                    &self.pins,
+                                    &self.running_windows,
+                                )
+                            })
+                    });
                     if member.executable_paths.is_empty() {
                         self.settings.app_groups.remove(group_index);
                     }
@@ -6240,7 +7486,7 @@ impl DockState {
                     let previews: Vec<PreviewItem> = self
                         .running_windows
                         .iter()
-                        .filter(|window| window.exe_path.eq_ignore_ascii_case(&path))
+                        .filter(|window| group_member_matches_window(&path, window))
                         .map(|window| PreviewItem {
                             hwnd: window.hwnd,
                             pid: window.pid,
@@ -6319,9 +7565,8 @@ impl DockState {
         }
     }
 
-    /// Left-click on a folder stack: a dedicated flyout listing the folder's
-    /// visible subfolders (alphabetical) then recent files, capped at
-    /// `STACK_FLYOUT_MAX_ITEMS`, with an "Open in File Explorer" footer.
+    /// Left-click on a folder stack: opens a live-hydrating flyout immediately (< 10 ms)
+    /// without running `read_dir` or shell icon extraction on the dock UI thread.
     fn open_stack_flyout(&mut self, index: usize) {
         if self.hover_flyout_open {
             return;
@@ -6331,80 +7576,199 @@ impl DockState {
         };
         let path = visual.path.clone();
         let label = visual.label.clone();
-        let entries = read_stack_entries(&path).unwrap_or_default();
-        if let Some(visual) = self.stack_visuals.get_mut(index) {
-            visual.cached_count = Some((Instant::now(), entries.len()));
+        let canonical = canonical_folder_key(&path);
+        let flyout_tag = format!("stack:{canonical}");
+        // Check reopen suppression BEFORE any directory/snapshot or icon work,
+        // keyed by normalized folder path so identically named folders never collide.
+        if crate::ui::flyout::should_suppress_reopen(&flyout_tag) {
+            return;
         }
-        let shown = layout::order_stack_entries(entries, layout::STACK_FLYOUT_MAX_ITEMS);
-        let row_paths: Vec<String> = shown.iter().map(|entry| entry.path.clone()).collect();
-        let icons = if row_paths.is_empty() {
-            HashMap::new()
-        } else {
-            icon_cache::resolve_batch_raw(&row_paths)
+
+        let now = Instant::now();
+        let cached_snap = self.folder_snapshots.get(&path).cloned();
+        let scan_gen = self.folder_snapshots.generation(&path);
+        let needs_scan = cached_snap.as_ref().is_none_or(|snap| !snap.is_fresh(now));
+        let mut current_entries: Option<Vec<layout::StackEntry>> = match cached_snap.as_ref() {
+            Some(snap) => snap
+                .entries
+                .clone()
+                .or_else(|| (!needs_scan).then(Vec::new)),
+            None => None,
         };
-        let mut blocks = Vec::with_capacity(shown.len() + 3);
-        if shown.is_empty() {
-            blocks.push(FlyoutBlock::Note(loc::t("StackEmpty")));
+        let mut resolved_icons: HashMap<String, FlyoutIcon> = HashMap::new();
+        if let Some(entries) = current_entries.as_deref() {
+            for entry in entries {
+                if let Some(icon) =
+                    icon_cache::lookup_memory_cached(&entry.path, icon_cache::ICON_PX)
+                {
+                    resolved_icons.insert(entry.path.clone(), flyout_icon_from_tuple(icon));
+                }
+            }
         }
-        for (offset, entry) in shown.iter().enumerate() {
-            let icon = icons
-                .get(&entry.path)
-                .and_then(Option::as_ref)
-                .map(|raw| FlyoutIcon {
-                    width: raw.width,
-                    height: raw.height,
-                    bgra: raw.pixels.to_vec(),
-                });
-            blocks.push(FlyoutBlock::ActionRow {
-                id: STACK_FLYOUT_ROW_ID_BASE + offset as u32,
-                // `T3 Code (Beta).lnk` reads as `T3 Code (Beta)`; launching
-                // still uses `entry.path` (the full shortcut path).
-                title: stack_entry_display_name(&entry.name),
-                subtitle: entry.is_dir.then(|| loc::t("FolderLabel")),
-                badge: None,
-                icon,
-                destructive: false,
-            });
-        }
-        blocks.push(FlyoutBlock::Separator);
-        blocks.push(FlyoutBlock::ButtonBar(vec![(
-            STACK_FLYOUT_OPEN_FOLDER_ID,
-            loc::t("OpenFolderInExplorer"),
-            false,
-        )]));
-        let spec = FlyoutSpec {
-            title: label,
-            subtitle: Some(path.clone()),
-            width_dips: 320.0,
-            blocks,
-        };
+        let mut row_ids = StackRowIds::new();
+        let initial_spec = build_stack_flyout_spec(
+            &label,
+            &path,
+            current_entries.as_deref(),
+            &resolved_icons,
+            &mut row_ids,
+        );
+
         let (anchor_x, anchor_y) = self.stack_rects_dips().get(index).copied().map_or_else(
             || self.flyout_anchor_center_px(),
             |rc| self.flyout_anchor_px(rc),
         );
+
+        let (tx, rx) = mpsc::channel::<StackHydrationMsg>();
+        let live_handle = LiveUpdateHandle::new();
+        crate::ui::flyout::set_next_live_update_handle(Some(live_handle.clone()));
+
+        let worker_path = path.clone();
+        let worker_key = canonical;
+        let worker_entries = current_entries.clone();
+        let worker_handle = live_handle.clone();
+        let pending_snaps = self.pending_folder_snapshots.clone();
+        let dock_hwnd = self.hwnd;
+        let _ = std::thread::Builder::new()
+            .name("dock-stack-hydrate".to_owned())
+            .spawn(move || {
+                let entries = if needs_scan {
+                    let scanned = read_stack_entries(&worker_path);
+                    let (ordered, snap_result) = match scanned {
+                        Some(raw) => {
+                            let total_count = raw.len();
+                            let ordered =
+                                layout::order_stack_entries(raw, layout::STACK_FLYOUT_MAX_ITEMS);
+                            let res = FolderSnapshotResult {
+                                key: worker_key,
+                                generation: scan_gen,
+                                entries: Some(ordered.clone()),
+                                total_count,
+                                refreshed_at: Instant::now(),
+                            };
+                            (ordered, res)
+                        }
+                        None => (
+                            Vec::new(),
+                            FolderSnapshotResult {
+                                key: worker_key,
+                                generation: scan_gen,
+                                entries: None,
+                                total_count: 0,
+                                refreshed_at: Instant::now(),
+                            },
+                        ),
+                    };
+                    if let Ok(mut queue) = pending_snaps.lock() {
+                        queue.push(snap_result);
+                    }
+                    unsafe {
+                        let _ = PostMessageW(dock_hwnd as HWND, WM_APP_FOLDER_SNAPSHOT, 0, 0);
+                    }
+                    if !worker_handle.is_closed() {
+                        let _ = tx.send(StackHydrationMsg::Snapshot(ordered.clone()));
+                        worker_handle.notify();
+                    }
+                    ordered
+                } else {
+                    worker_entries.unwrap_or_default()
+                };
+
+                if worker_handle.is_closed() || entries.is_empty() {
+                    return;
+                }
+
+                // Resolve uncached real icons off-thread: visible first 12 rows first,
+                // then the remaining rows, streaming LiveEvent::Update patches as they finish.
+                let uncached: Vec<String> = entries
+                    .iter()
+                    .map(|e| e.path.clone())
+                    .filter(|spec| {
+                        icon_cache::lookup_memory_cached(spec, icon_cache::ICON_PX).is_none()
+                    })
+                    .collect();
+                if uncached.is_empty() {
+                    return;
+                }
+                let split = uncached.len().min(12);
+                let (first_batch, rest_batch) = uncached.split_at(split);
+                for batch in [first_batch, rest_batch] {
+                    if batch.is_empty() || worker_handle.is_closed() {
+                        continue;
+                    }
+                    let icons = icon_cache::resolve_batch_with_fallback(batch, icon_cache::ICON_PX);
+                    if !icons.is_empty() && !worker_handle.is_closed() {
+                        let _ = tx.send(StackHydrationMsg::Icons(icons));
+                        worker_handle.notify();
+                    }
+                }
+            });
+
         self.hide_tooltip_for_flyout();
         self.hover_flyout_open = true;
-        let action = {
+        let mut pending_launch: Option<PathBuf> = None;
+        let mut open_explorer = false;
+        let mut last_spec = initial_spec.clone();
+        {
             let _modal_guard = dynamic_island::ModalFlyoutGuard::enter();
-            crate::ui::flyout::show_primary_with_options(
+            crate::ui::flyout::show_flyout_live_with_options(
+                &flyout_tag,
                 self.hwnd,
                 self.is_dark,
                 anchor_x,
                 anchor_y,
-                spec,
+                initial_spec,
                 BorderStyle::from_menu_settings(self.is_dark, &self.settings),
                 FlyoutOptions::stack().with_edge(self.dock_flyout_edge()),
-            )
-        };
+                |event| match event {
+                    LiveEvent::Update => {
+                        let mut changed = false;
+                        while let Ok(msg) = rx.try_recv() {
+                            match msg {
+                                StackHydrationMsg::Snapshot(entries) => {
+                                    current_entries = Some(entries);
+                                    changed = true;
+                                }
+                                StackHydrationMsg::Icons(batch) => {
+                                    for (spec, icon) in batch {
+                                        resolved_icons.insert(spec, flyout_icon_from_tuple(icon));
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if changed {
+                            last_spec = build_stack_flyout_spec(
+                                &label,
+                                &path,
+                                current_entries.as_deref(),
+                                &resolved_icons,
+                                &mut row_ids,
+                            );
+                        }
+                        LiveOutcome::Update(last_spec.clone())
+                    }
+                    LiveEvent::Click(STACK_FLYOUT_OPEN_FOLDER_ID) => {
+                        open_explorer = true;
+                        LiveOutcome::Close
+                    }
+                    LiveEvent::Click(id) => {
+                        if let Some(target_path) = row_ids.path_for(id) {
+                            pending_launch = Some(target_path.to_path_buf());
+                        }
+                        LiveOutcome::Close
+                    }
+                    _ => LiveOutcome::Close,
+                },
+            );
+        }
+        live_handle.detach();
         self.hover_flyout_open = false;
-        match action {
-            Some(STACK_FLYOUT_OPEN_FOLDER_ID) => open_folder_in_explorer(&path),
-            Some(id) if id >= STACK_FLYOUT_ROW_ID_BASE => {
-                if let Some(entry) = shown.get((id - STACK_FLYOUT_ROW_ID_BASE) as usize) {
-                    pins::launch(entry.path.clone());
-                }
-            }
-            _ => {}
+        self.drain_folder_snapshots();
+        if open_explorer {
+            open_folder_in_explorer(&path);
+        } else if let Some(target) = pending_launch {
+            pins::launch(target.to_string_lossy().into_owned());
         }
         self.reconcile_pointer_after_interaction();
         self.update_visuals();
@@ -7628,7 +8992,8 @@ impl DockState {
         let Some(slot) = self.slots.get(idx).cloned() else {
             return;
         };
-        self.set_dock_pin(&slot.launch_path, !slot.pinned);
+        let pin_target = slot_pin_target(&slot);
+        self.set_dock_pin(&pin_target, !slot.pinned);
     }
 
     /// Entry point for notification aggregation (`RunningAppProjection.HasNotification`).
@@ -7944,7 +9309,7 @@ impl DockState {
                 .cloned()
                 .collect();
             if !sources.is_empty() {
-                let destination = [folder];
+                let destination = [folder.clone()];
                 let outcome = if win32::is_ctrl_down() {
                     shell_files::copy_files(
                         &sources,
@@ -7964,9 +9329,8 @@ impl DockState {
                     ));
                 }
             }
-            if let Some(visual) = self.stack_visuals.get_mut(index) {
-                visual.cached_count = None;
-            }
+            self.folder_snapshots.invalidate(&folder);
+            self.refresh_folder_snapshot_async(&folder);
             self.tooltip_cache = None;
             self.update_visuals();
             return;
@@ -7976,7 +9340,7 @@ impl DockState {
         if let Some(idx) = self.hovered_idx
             && let Some(slot) = self.slots.get(idx)
         {
-            let target = slot.launch_path.clone();
+            let target = drop_launch_target(slot, &self.pins, &self.running_windows);
             let args = layout::build_quoted_arguments(&files);
             pins::launch_with_args(target, args);
             return;
@@ -8265,6 +9629,11 @@ impl DockState {
         {
             let running = !slot.windows.is_empty();
             let window = slot.windows.first().map(|window| window.hwnd);
+            let terminate_exe = slot
+                .windows
+                .first()
+                .and_then(|first| resolve_terminate_exe(&slot, first, &self.running_windows))
+                .map(str::to_owned);
             // Ctrl+right-click reaches the target application's own menu via the
             // WS-B wrappers instead of our dock menu.
             if win32::is_ctrl_down()
@@ -8300,21 +9669,23 @@ impl DockState {
                     // adds this app, and the flyout's Remove button undoes it.
                     let group_has_slot = self.settings.app_groups.get(gidx).is_some_and(|group| {
                         group.executable_paths.len() > 1
-                            && group
-                                .executable_paths
-                                .iter()
-                                .any(|path| path.eq_ignore_ascii_case(&slot.launch_path))
+                            && group.executable_paths.iter().any(|path| {
+                                group_member_matches_slot(
+                                    path,
+                                    &slot,
+                                    &self.pins,
+                                    &self.running_windows,
+                                )
+                            })
                     });
                     if group_has_slot {
                         self.open_group_flyout(gidx, &slot.launch_path);
                         return;
                     }
                     if let Some(group) = self.settings.app_groups.get_mut(gidx) {
-                        if let Some(pos) = group
-                            .executable_paths
-                            .iter()
-                            .position(|p| p.eq_ignore_ascii_case(&slot.launch_path))
-                        {
+                        if let Some(pos) = group.executable_paths.iter().position(|p| {
+                            group_member_matches_slot(p, &slot, &self.pins, &self.running_windows)
+                        }) {
                             group.executable_paths.remove(pos);
                             if group.executable_paths.is_empty() {
                                 self.settings.app_groups.remove(gidx);
@@ -8338,11 +9709,14 @@ impl DockState {
                             .iter_mut()
                             .find(|g| g.name.eq_ignore_ascii_case(&name))
                         {
-                            if !existing
-                                .executable_paths
-                                .iter()
-                                .any(|p| p.eq_ignore_ascii_case(&slot.launch_path))
-                            {
+                            if !existing.executable_paths.iter().any(|p| {
+                                group_member_matches_slot(
+                                    p,
+                                    &slot,
+                                    &self.pins,
+                                    &self.running_windows,
+                                )
+                            }) {
                                 existing.executable_paths.push(slot.launch_path.clone());
                             }
                         } else {
@@ -8369,11 +9743,13 @@ impl DockState {
                     }
                 }
                 AppContextAction::Terminate => {
-                    if let Some(first) = slot.windows.first() {
+                    if let (Some(first), Some(expected_exe)) =
+                        (slot.windows.first(), terminate_exe.as_deref())
+                    {
                         tracker::terminate_window_process_verified(
                             first.hwnd,
                             first.pid,
-                            &slot.launch_path,
+                            expected_exe,
                         );
                     }
                 }
@@ -9487,6 +10863,10 @@ unsafe extern "system" fn wnd_proc(
             state.drain_smart_capture_results();
             0
         }
+        WM_APP_FOLDER_SNAPSHOT => {
+            state.drain_folder_snapshots();
+            0
+        }
         WM_APP_SHELL_FLYOUT => {
             let kind = flyout_kind_from_code(wparam);
             // Unknown flyout HWND: pass 0 and let the reposition worker discover
@@ -10008,6 +11388,11 @@ mod tests {
     use super::*;
     use crate::ui::menu::MenuIcon;
 
+    /// Number of visible items in a folder stack (test helper; runtime hover uses `FolderSnapshotCache`).
+    fn stack_item_count(path: &str) -> Option<usize> {
+        read_stack_entries(path).map(|entries| entries.len())
+    }
+
     #[test]
     fn hover_flyout_gate_accepts_legacy_casing_and_custom_ids() {
         assert!(widget_has_flyout_ci("clock"));
@@ -10210,12 +11595,14 @@ mod tests {
                 name: "Alpha".into(),
                 launch_path: r"C:\Alpha.lnk".into(),
                 target_exe: Some(r"C:\Alpha.exe".into()),
+                aumid: None,
                 icon_source: r"C:\Alpha.exe".into(),
             },
             PinnedApp {
                 name: "Beta".into(),
                 launch_path: r"C:\Beta.lnk".into(),
                 target_exe: Some(r"C:\Beta.exe".into()),
+                aumid: None,
                 icon_source: r"C:\Beta.exe".into(),
             },
         ];
@@ -10318,6 +11705,7 @@ mod tests {
             name: "Running".into(),
             launch_path: windows[0].exe_path.clone(),
             target_exe: Some(windows[0].exe_path.clone()),
+            aumid: None,
             icon_source: windows[0].exe_path.clone(),
         };
         let pins = [pin];
@@ -11256,5 +12644,616 @@ mod tests {
         let gentle = widget_shrink_factors(&widths, 10_000.0, -3);
         assert!(gentle.values().all(|scale| *scale > 0.84));
         assert!(!gentle.contains_key("clock"), "priority 80 > ceiling 76");
+    }
+
+    #[test]
+    fn aumid_first_grouping_separates_hosted_uwp_apps_and_upgrades_identity() {
+        let settings_aumid =
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+        let calc_aumid = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+        let host_exe = r"C:\Windows\System32\ApplicationFrameHost.exe";
+
+        let settings_win = RunningWindow {
+            hwnd: 501,
+            pid: 1001,
+            title: "Settings".into(),
+            exe_path: host_exe.into(),
+            aumid: settings_aumid.into(),
+            is_foreground: true,
+        };
+        let calc_win = RunningWindow {
+            hwnd: 502,
+            pid: 1002,
+            title: "Calculator".into(),
+            exe_path: host_exe.into(),
+            aumid: calc_aumid.into(),
+            is_foreground: false,
+        };
+
+        // Even with AggregateByExecutablePath enabled, distinct UWP AUMIDs on
+        // ApplicationFrameHost.exe must NEVER collapse into one slot.
+        assert_ne!(
+            running_group_key(&settings_win, false),
+            running_group_key(&calc_win, false)
+        );
+        assert_ne!(
+            running_group_key(&settings_win, true),
+            running_group_key(&calc_win, true)
+        );
+
+        let settings_pin = PinnedApp {
+            name: "Settings".into(),
+            launch_path: format!(r"shell:AppsFolder\{settings_aumid}"),
+            target_exe: None,
+            aumid: Some(settings_aumid.into()),
+            icon_source: format!(r"shell:AppsFolder\{settings_aumid}"),
+        };
+
+        let slots = build_slots_for(
+            &[settings_pin],
+            &[settings_win, calc_win.clone()],
+            &[],
+            &DockSettings::default(),
+        );
+        assert_eq!(slots.len(), 2, "Settings pin + separate Calculator slot");
+        assert!(slots[0].pinned);
+        assert_eq!(slots[0].windows.len(), 1);
+        assert_eq!(slots[0].windows[0].hwnd, 501);
+        assert_eq!(
+            slots[0].icon_source,
+            format!(r"shell:AppsFolder\{settings_aumid}")
+        );
+        assert_eq!(slots[0].rep_hwnd, Some(501));
+
+        assert!(!slots[1].pinned);
+        assert_eq!(slots[1].windows.len(), 1);
+        assert_eq!(slots[1].windows[0].hwnd, 502);
+        assert_eq!(slots[1].label, "Calculator");
+        assert_eq!(
+            slots[1].icon_source,
+            format!(r"shell:AppsFolder\{calc_aumid}")
+        );
+        assert_eq!(
+            slot_pin_target(&slots[1]),
+            format!(r"shell:AppsFolder\{calc_aumid}")
+        );
+
+        // Identity upgrade: an unattached ApplicationFrameHost window starts with empty AUMID,
+        // then attaches its CoreWindow and acquires its real AUMID on the next poll.
+        let unattached = RunningWindow {
+            hwnd: 777,
+            pid: 2001,
+            title: "Calculator".into(),
+            exe_path: host_exe.into(),
+            aumid: String::new(),
+            is_foreground: false,
+        };
+        let initial = build_slots_for(&[], &[unattached], &[], &DockSettings::default());
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].aumid.is_none());
+
+        let attached = RunningWindow {
+            hwnd: 777,
+            pid: 2001,
+            title: "Calculator".into(),
+            exe_path: host_exe.into(),
+            aumid: calc_aumid.into(),
+            is_foreground: true,
+        };
+        let upgraded = build_slots_for(&[], &[attached], &initial, &DockSettings::default());
+        assert_eq!(upgraded.len(), 1);
+        assert_eq!(upgraded[0].aumid.as_deref(), Some(calc_aumid));
+        assert_eq!(
+            upgraded[0].icon_source,
+            format!(r"shell:AppsFolder\{calc_aumid}")
+        );
+        assert_eq!(
+            upgraded[0].icon_candidates,
+            vec![format!(r"shell:AppsFolder\{calc_aumid}")]
+        );
+    }
+
+    #[test]
+    fn icon_retry_backoff_caps_attempts_and_resets_when_candidates_improve() {
+        let t0 = Instant::now();
+        let initial_sig = vec![r"C:\Windows\System32\ApplicationFrameHost.exe".to_owned()];
+
+        assert!(IconRetryState::should_attempt(None, &initial_sig, t0));
+
+        // Failure 1 -> wait 1.5s.
+        let r1 = IconRetryState::record_failure(None, initial_sig.clone(), t0);
+        assert_eq!(r1.attempts, 1);
+        assert!(!IconRetryState::should_attempt(
+            Some(&r1),
+            &initial_sig,
+            t0 + Duration::from_millis(1_499)
+        ));
+        assert!(IconRetryState::should_attempt(
+            Some(&r1),
+            &initial_sig,
+            t0 + Duration::from_millis(1_500)
+        ));
+
+        // Failure 2 -> wait 5s, Failure 3 -> wait 15s, Failure 4 -> wait 45s.
+        let t1 = t0 + Duration::from_millis(1_500);
+        let r2 = IconRetryState::record_failure(Some(&r1), initial_sig.clone(), t1);
+        assert_eq!(r2.attempts, 2);
+        assert!(!IconRetryState::should_attempt(
+            Some(&r2),
+            &initial_sig,
+            t1 + Duration::from_millis(4_999)
+        ));
+        assert!(IconRetryState::should_attempt(
+            Some(&r2),
+            &initial_sig,
+            t1 + Duration::from_millis(5_000)
+        ));
+
+        let t2 = t1 + Duration::from_millis(5_000);
+        let r3 = IconRetryState::record_failure(Some(&r2), initial_sig.clone(), t2);
+        assert_eq!(r3.attempts, 3);
+        assert!(IconRetryState::should_attempt(
+            Some(&r3),
+            &initial_sig,
+            t2 + Duration::from_millis(15_000)
+        ));
+
+        let t3 = t2 + Duration::from_millis(15_000);
+        let r4 = IconRetryState::record_failure(Some(&r3), initial_sig.clone(), t3);
+        assert_eq!(r4.attempts, 4);
+        assert!(!IconRetryState::should_attempt(
+            Some(&r4),
+            &initial_sig,
+            t3 + Duration::from_millis(44_999)
+        ));
+        assert!(IconRetryState::should_attempt(
+            Some(&r4),
+            &initial_sig,
+            t3 + Duration::from_millis(45_000)
+        ));
+
+        // Failure 5 (after the 4th retry) exceeds the retry cap and stops retrying.
+        let t4 = t3 + Duration::from_millis(45_000);
+        let r5 = IconRetryState::record_failure(Some(&r4), initial_sig.clone(), t4);
+        assert_eq!(r5.attempts, 5);
+        assert!(!IconRetryState::should_attempt(
+            Some(&r5),
+            &initial_sig,
+            t4 + Duration::from_secs(3600)
+        ));
+
+        // As soon as the slot's candidates improve, retry eligibility resets immediately.
+        let improved_sig =
+            vec![r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App".to_owned()];
+        assert!(IconRetryState::should_attempt(Some(&r5), &improved_sig, t4));
+        let reset = IconRetryState::record_failure(Some(&r5), improved_sig, t4);
+        assert_eq!(reset.attempts, 1);
+    }
+
+    #[test]
+    fn stack_row_ids_stay_stable_when_async_refresh_inserts_new_items() {
+        let mut ids = StackRowIds::new();
+        let a_id = ids.id_for(r"C:\Downloads\alpha.pdf");
+        let b_id = ids.id_for(r"C:\Downloads\beta.zip");
+        // Async refresh prepends a new file at index 0; existing paths keep their IDs.
+        let new_id = ids.id_for(r"C:\Downloads\newest.png");
+        assert_ne!(new_id, a_id);
+        assert_ne!(new_id, b_id);
+        assert_eq!(ids.id_for(r"c:\downloads\alpha.pdf"), a_id);
+        assert_eq!(ids.id_for(r"C:\Downloads\beta.zip"), b_id);
+        assert_eq!(
+            ids.path_for(a_id),
+            Some(Path::new(r"C:\Downloads\alpha.pdf"))
+        );
+        assert_eq!(
+            ids.path_for(b_id),
+            Some(Path::new(r"C:\Downloads\beta.zip"))
+        );
+        assert_eq!(
+            ids.path_for(new_id),
+            Some(Path::new(r"C:\Downloads\newest.png"))
+        );
+    }
+
+    #[test]
+    fn folder_snapshot_cache_caches_failures_and_drops_stale_generations() {
+        let mut cache = FolderSnapshotCache::default();
+        let path = r"C:\Missing\Unmounted";
+        let key = canonical_folder_key(path);
+        let t0 = Instant::now();
+
+        let gen0 = cache.mark_in_flight(path).expect("cold scan starts");
+        assert_eq!(cache.mark_in_flight(path), None, "dedupes in-flight scan");
+
+        // Failed/unreadable scan records a fresh failure timestamp so hover does not loop.
+        assert!(cache.complete(FolderSnapshotResult {
+            key: key.clone(),
+            generation: gen0,
+            entries: None,
+            total_count: 0,
+            refreshed_at: t0,
+        }));
+        let snap = cache.get(path).expect("failed scan is cached");
+        assert!(snap.entries.is_none());
+        assert_eq!(snap.total_count, None);
+        assert!(snap.is_fresh(t0));
+        assert!(!snap.in_flight);
+
+        // Start a refresh, then invalidate (e.g. file drop) and start a newer generation.
+        let gen_old = cache.mark_in_flight(path).expect("refresh starts");
+        cache.invalidate(path);
+        let gen_new = cache
+            .mark_in_flight(path)
+            .expect("post-invalidation scan starts");
+        assert_ne!(gen_old, gen_new);
+
+        let fresh_entry = layout::StackEntry {
+            path: r"C:\Missing\Unmounted\dropped.txt".into(),
+            name: "dropped.txt".into(),
+            is_dir: false,
+            modified_secs: 100,
+        };
+        assert!(cache.complete(FolderSnapshotResult {
+            key: key.clone(),
+            generation: gen_new,
+            entries: Some(vec![fresh_entry]),
+            total_count: 1,
+            refreshed_at: t0 + Duration::from_millis(50),
+        }));
+
+        // Late completion from the invalidated generation must be ignored.
+        assert!(!cache.complete(FolderSnapshotResult {
+            key,
+            generation: gen_old,
+            entries: Some(Vec::new()),
+            total_count: 0,
+            refreshed_at: t0 + Duration::from_millis(100),
+        }));
+        let current = cache.get(path).expect("fresh snapshot preserved");
+        assert_eq!(current.total_count, Some(1));
+        assert_eq!(current.entries.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn deterministic_pin_matching_chrome_and_pwa_never_swap() {
+        let chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        let pwa_aumid = "Chrome._crx_pwadeterministic123";
+
+        let chrome_pin = PinnedApp {
+            name: "Google Chrome".into(),
+            launch_path: r"C:\Users\Test\Chrome.lnk".into(),
+            target_exe: Some(chrome_exe.into()),
+            aumid: None,
+            icon_source: chrome_exe.into(),
+        };
+        let pwa_pin = PinnedApp {
+            name: "Docs PWA".into(),
+            launch_path: r"C:\Users\Test\DocsPWA.lnk".into(),
+            target_exe: Some(chrome_exe.into()),
+            aumid: Some(pwa_aumid.into()),
+            icon_source: r"C:\Users\Test\DocsPWA.lnk".into(),
+        };
+
+        let chrome_win_with_aumid = RunningWindow {
+            hwnd: 101,
+            pid: 4001,
+            title: "New Tab - Google Chrome".into(),
+            exe_path: chrome_exe.into(),
+            aumid: "Chrome".into(),
+            is_foreground: true,
+        };
+        let chrome_win_no_aumid = RunningWindow {
+            hwnd: 102,
+            pid: 4001,
+            title: "DevTools - Google Chrome".into(),
+            exe_path: chrome_exe.into(),
+            aumid: String::new(),
+            is_foreground: false,
+        };
+        let pwa_win = RunningWindow {
+            hwnd: 103,
+            pid: 4002,
+            title: "Docs".into(),
+            exe_path: chrome_exe.into(),
+            aumid: pwa_aumid.into(),
+            is_foreground: false,
+        };
+
+        // Test both pin orders to prove determinism and zero swapping.
+        for pins in [
+            vec![chrome_pin.clone(), pwa_pin.clone()],
+            vec![pwa_pin.clone(), chrome_pin.clone()],
+        ] {
+            let slots = build_slots_for(
+                &pins,
+                &[
+                    pwa_win.clone(),
+                    chrome_win_with_aumid.clone(),
+                    chrome_win_no_aumid.clone(),
+                ],
+                &[],
+                &DockSettings::default(),
+            );
+            assert_eq!(slots.len(), 2, "no orphan duplicate Chrome icon");
+            let chrome_slot = slots
+                .iter()
+                .find(|s| s.label == "Google Chrome")
+                .expect("Chrome pin slot");
+            let pwa_slot = slots
+                .iter()
+                .find(|s| s.label == "Docs PWA")
+                .expect("PWA pin slot");
+            assert_eq!(chrome_slot.hwnds(), vec![101, 102]);
+            assert_eq!(pwa_slot.hwnds(), vec![103]);
+        }
+    }
+
+    #[test]
+    fn win32_pin_with_different_shortcut_aumid_matches_running_window_by_non_host_exe() {
+        let code_exe = r"C:\Users\Test\AppData\Local\Programs\Microsoft VS Code\Code.exe";
+        let vscode_pin = PinnedApp {
+            name: "Visual Studio Code".into(),
+            launch_path: r"C:\Users\Test\VSCode.lnk".into(),
+            target_exe: Some(code_exe.into()),
+            aumid: Some("Shortcut.VSCode.Custom".into()),
+            icon_source: code_exe.into(),
+        };
+        let vscode_win = RunningWindow {
+            hwnd: 201,
+            pid: 5001,
+            title: "mod.rs - OpenTaskbar".into(),
+            exe_path: code_exe.into(),
+            aumid: "Microsoft.VisualStudioCode".into(),
+            is_foreground: true,
+        };
+
+        let slots = build_slots_for(&[vscode_pin], &[vscode_win], &[], &DockSettings::default());
+        assert_eq!(
+            slots.len(),
+            1,
+            "mismatched shortcut AUMID must not split into dead pin + duplicate"
+        );
+        assert!(slots[0].pinned);
+        assert_eq!(slots[0].hwnds(), vec![201]);
+    }
+
+    #[test]
+    fn hosted_uwp_apps_under_application_frame_host_stay_strictly_separated_by_aumid() {
+        let host_exe = r"C:\Windows\System32\ApplicationFrameHost.exe";
+        let settings_aumid =
+            "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+        let calc_aumid = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+
+        let settings_pin = PinnedApp {
+            name: "Settings".into(),
+            launch_path: format!(r"shell:AppsFolder\{settings_aumid}"),
+            target_exe: Some(host_exe.into()),
+            aumid: Some(settings_aumid.into()),
+            icon_source: format!(r"shell:AppsFolder\{settings_aumid}"),
+        };
+        let calc_pin = PinnedApp {
+            name: "Calculator".into(),
+            launch_path: format!(r"shell:AppsFolder\{calc_aumid}"),
+            target_exe: Some(host_exe.into()),
+            aumid: Some(calc_aumid.into()),
+            icon_source: format!(r"shell:AppsFolder\{calc_aumid}"),
+        };
+        let settings_win = RunningWindow {
+            hwnd: 301,
+            pid: 6001,
+            title: "Settings".into(),
+            exe_path: host_exe.into(),
+            aumid: settings_aumid.into(),
+            is_foreground: false,
+        };
+        let calc_win = RunningWindow {
+            hwnd: 302,
+            pid: 6002,
+            title: "Calculator".into(),
+            exe_path: host_exe.into(),
+            aumid: calc_aumid.into(),
+            is_foreground: true,
+        };
+
+        // Both running: each attaches strictly to its own AUMID pin.
+        let both = build_slots_for(
+            &[settings_pin.clone(), calc_pin],
+            &[settings_win, calc_win.clone()],
+            &[],
+            &DockSettings::default(),
+        );
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0].hwnds(), vec![301]);
+        assert_eq!(both[1].hwnds(), vec![302]);
+
+        // Only Settings pinned while only Calculator runs: Settings must NEVER claim Calculator.
+        let sep = build_slots_for(&[settings_pin], &[calc_win], &[], &DockSettings::default());
+        assert_eq!(sep.len(), 2);
+        assert!(sep[0].pinned && sep[0].windows.is_empty());
+        assert!(!sep[1].pinned && sep[1].hwnds() == vec![302]);
+    }
+
+    #[test]
+    fn empty_exe_and_aumid_windows_isolate_by_hwnd_and_keep_hwnd_icon_key() {
+        let taskmgr = RunningWindow {
+            hwnd: 901,
+            pid: 7001,
+            title: "Task Manager".into(),
+            exe_path: String::new(),
+            aumid: String::new(),
+            is_foreground: true,
+        };
+        let regedit = RunningWindow {
+            hwnd: 902,
+            pid: 7002,
+            title: "Registry Editor".into(),
+            exe_path: String::new(),
+            aumid: String::new(),
+            is_foreground: false,
+        };
+
+        assert_eq!(running_group_key(&taskmgr, false), "hwnd:901");
+        assert_eq!(running_group_key(&taskmgr, true), "hwnd:901");
+        assert_ne!(
+            running_group_key(&taskmgr, false),
+            running_group_key(&regedit, false)
+        );
+
+        let slots = build_slots_for(&[], &[taskmgr, regedit], &[], &DockSettings::default());
+        assert_eq!(slots.len(), 2);
+        assert!(slots[0].icon_source.is_empty());
+        assert_eq!(slot_icon_key(&slots[0]).as_deref(), Some("hwnd:901"));
+        assert_eq!(slot_icon_key(&slots[1]).as_deref(), Some("hwnd:902"));
+    }
+
+    #[test]
+    fn end_task_and_drop_target_resolve_real_non_host_exe_for_packaged_apps() {
+        let aumid = "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App";
+        let real_exe = r"C:\Program Files\WindowsApps\5319275A.WhatsAppDesktop_2.0_x64__cv1g1gvanyjgm\WhatsApp.Root.exe";
+        let host_exe = r"C:\Windows\System32\ApplicationFrameHost.exe";
+
+        let packaged_win = RunningWindow {
+            hwnd: 401,
+            pid: 8001,
+            title: "WhatsApp".into(),
+            exe_path: real_exe.into(),
+            aumid: aumid.into(),
+            is_foreground: true,
+        };
+        let packaged_pin = PinnedApp {
+            name: "WhatsApp".into(),
+            launch_path: format!(r"shell:AppsFolder\{aumid}"),
+            target_exe: Some(real_exe.into()),
+            aumid: Some(aumid.into()),
+            icon_source: format!(r"shell:AppsFolder\{aumid}"),
+        };
+        let slots = build_slots_for(
+            std::slice::from_ref(&packaged_pin),
+            std::slice::from_ref(&packaged_win),
+            &[],
+            &DockSettings::default(),
+        );
+        let slot = &slots[0];
+        let first = &slot.windows[0];
+
+        assert_eq!(
+            resolve_terminate_exe(slot, first, std::slice::from_ref(&packaged_win)),
+            Some(real_exe)
+        );
+        assert_eq!(
+            drop_launch_target(
+                slot,
+                std::slice::from_ref(&packaged_pin),
+                std::slice::from_ref(&packaged_win)
+            ),
+            real_exe
+        );
+
+        // Hosted UWP under ApplicationFrameHost.exe: never terminate host, fall back to AppsFolder on drop.
+        let calc_aumid = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+        let calc_win = RunningWindow {
+            hwnd: 402,
+            pid: 8002,
+            title: "Calculator".into(),
+            exe_path: host_exe.into(),
+            aumid: calc_aumid.into(),
+            is_foreground: false,
+        };
+        let calc_slots = build_slots_for(
+            &[],
+            std::slice::from_ref(&calc_win),
+            &[],
+            &DockSettings::default(),
+        );
+        assert_eq!(
+            resolve_terminate_exe(
+                &calc_slots[0],
+                &calc_slots[0].windows[0],
+                std::slice::from_ref(&calc_win)
+            ),
+            None
+        );
+        assert_eq!(
+            drop_launch_target(&calc_slots[0], &[], &[calc_win]),
+            format!(r"shell:AppsFolder\{calc_aumid}")
+        );
+
+        // Group matching matches packaged windows by shell:AppsFolder\<AUMID> and legacy exe_path.
+        assert!(group_member_matches_window(
+            &format!(r"shell:AppsFolder\{aumid}"),
+            &packaged_win
+        ));
+        assert!(group_member_matches_window(real_exe, &packaged_win));
+        assert!(group_member_matches_slot(
+            real_exe,
+            slot,
+            &[packaged_pin],
+            &[packaged_win]
+        ));
+    }
+
+    #[test]
+    fn icon_cache_probe_distinguishes_primary_hit_from_fallback_upgrade() {
+        let candidates = vec![
+            r"shell:AppsFolder\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App".to_owned(),
+            r"C:\Program Files\WindowsApps\Terminal\WindowsTerminal.exe".to_owned(),
+        ];
+        assert_eq!(
+            probe_cached_icon_candidates(&candidates, |cand| {
+                cand.ends_with(".exe").then_some("exe-fallback")
+            }),
+            IconCacheProbe::FallbackHit {
+                surface: "exe-fallback",
+                upgrade_prefix_len: 1,
+            }
+        );
+        assert_eq!(
+            probe_cached_icon_candidates(&candidates, |cand| {
+                cand.starts_with("shell:").then_some("appsfolder-primary")
+            }),
+            IconCacheProbe::PrimaryHit("appsfolder-primary")
+        );
+        assert_eq!(
+            probe_cached_icon_candidates::<&str>(&candidates, |_| None),
+            IconCacheProbe::Miss
+        );
+    }
+
+    #[test]
+    fn merge_user_pins_deduplicates_legacy_packaged_exe_by_aumid() {
+        let aumid = "Microsoft.WindowsTerminal_8wekyb3d8bbwe!App";
+        let apps_folder = format!(r"shell:AppsFolder\{aumid}");
+        let legacy_exe = r"C:\Program Files\WindowsApps\Microsoft.WindowsTerminal_1.20_x64__8wekyb3d8bbwe\WindowsTerminal.exe";
+
+        let mut items = vec![PinnedApp {
+            name: "Terminal".into(),
+            launch_path: apps_folder.clone(),
+            target_exe: None,
+            aumid: Some(aumid.into()),
+            icon_source: apps_folder.clone(),
+        }];
+        let settings = DockSettings {
+            user_pinned_apps: vec![legacy_exe.into()],
+            ..DockSettings::default()
+        };
+
+        merge_user_pins(&mut items, &settings, |raw| {
+            if raw.eq_ignore_ascii_case(legacy_exe) {
+                Some(PinnedApp {
+                    name: "Terminal".into(),
+                    launch_path: apps_folder.clone(),
+                    target_exe: Some(legacy_exe.into()),
+                    aumid: Some(aumid.into()),
+                    icon_source: apps_folder.clone(),
+                })
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            items.len(),
+            1,
+            "legacy packaged exe pin must not duplicate existing AUMID pin"
+        );
     }
 }
